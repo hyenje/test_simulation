@@ -23,7 +23,13 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
 
   assert.match(page, /navigator\.mediaDevices\.getUserMedia/);
   assert.match(client, /KVSWebRTC/);
-  assert.match(client, /new RTCPeerConnection\(\{ iceServers: config\.iceServers \}\)/);
+  assert.match(client, /globalThis\.RTCPeerConnection/);
+  assert.match(client, /현재 브라우저는 WebRTC 실시간 영상을 지원하지 않습니다/);
+  assert.equal(
+    client.match(/new PeerConnection\(\{ iceServers: config\.iceServers \}\)/g)?.length,
+    2,
+  );
+  assert.doesNotMatch(client, /new RTCPeerConnection\(/);
   assert.match(client, /\/api\/kvs\/session/);
   assert.match(route, /getAuthorizedSession/);
   assert.match(broker, /GetSignalingChannelEndpointCommand/);

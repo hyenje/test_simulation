@@ -95,6 +95,7 @@ export async function connectKvsMaster(input: {
   stream: MediaStream;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
+  const PeerConnection = requireRtcPeerConnection();
   const [sdk, config] = await Promise.all([
     loadKvsSdk(),
     requestKvsSession(input.roomCode, "MASTER"),
@@ -130,7 +131,7 @@ export async function connectKvsMaster(input: {
     remoteClientId = senderClientId;
     input.callbacks.onState("connecting");
 
-    const nextPeer = new RTCPeerConnection({ iceServers: config.iceServers });
+    const nextPeer = new PeerConnection({ iceServers: config.iceServers });
     peer = nextPeer;
     input.stream.getTracks().forEach((track) => nextPeer.addTrack(track, input.stream));
 
@@ -196,6 +197,7 @@ export async function connectKvsViewer(input: {
   onStream: (stream: MediaStream) => void;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
+  const PeerConnection = requireRtcPeerConnection();
   const clientId = `petcam-${crypto.randomUUID()}`;
   const [sdk, config] = await Promise.all([
     loadKvsSdk(),
@@ -203,7 +205,7 @@ export async function connectKvsViewer(input: {
   ]);
   let closed = false;
   const queuedCandidates: RTCIceCandidateInit[] = [];
-  const peer = new RTCPeerConnection({ iceServers: config.iceServers });
+  const peer = new PeerConnection({ iceServers: config.iceServers });
   peer.addTransceiver("video", { direction: "recvonly" });
 
   const signaling = new sdk.SignalingClient({
@@ -318,4 +320,14 @@ async function loadKvsSdk(): Promise<KvsSdk> {
 
 function toError(error: unknown, fallback: string) {
   return error instanceof Error ? error : new Error(fallback);
+}
+
+function requireRtcPeerConnection() {
+  const PeerConnection = globalThis.RTCPeerConnection;
+  if (typeof PeerConnection !== "function") {
+    throw new Error(
+      "현재 브라우저는 WebRTC 실시간 영상을 지원하지 않습니다. 이 주소를 Chrome, Safari 또는 Edge에서 열어 주세요.",
+    );
+  }
+  return PeerConnection;
 }
