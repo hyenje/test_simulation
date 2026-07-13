@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 
 test("build contains the AWS pet camera product surface", async () => {
   await access(new URL("../dist/server/index.js", import.meta.url));
@@ -23,12 +25,14 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
 
   assert.match(page, /navigator\.mediaDevices\.getUserMedia/);
   assert.match(client, /KVSWebRTC/);
-  assert.match(client, /globalThis\.RTCPeerConnection/);
-  assert.match(client, /현재 브라우저는 WebRTC 실시간 영상을 지원하지 않습니다/);
+  assert.match(client, /browserWindow\.RTCPeerConnection/);
+  assert.match(client, /browserWindow\.webkitRTCPeerConnection/);
+  assert.match(client, /AdGuard 등 확장 프로그램의 WebRTC 차단을 끈 뒤 새로고침해 주세요/);
   assert.equal(
     client.match(/new PeerConnection\(\{ iceServers: config\.iceServers \}\)/g)?.length,
     2,
   );
+  assert.doesNotMatch(client, /globalThis\.RTCPeerConnection/);
   assert.doesNotMatch(client, /new RTCPeerConnection\(/);
   assert.match(client, /\/api\/kvs\/session/);
   assert.match(route, /getAuthorizedSession/);
@@ -46,4 +50,37 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   const browserSource = `${page}\n${client}`;
   assert.doesNotMatch(browserSource, /BroadcastChannel|LiveKit|MediaRecorder|localStorage/);
   assert.doesNotMatch(browserSource, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AKIA[0-9A-Z]{16}/);
+
+  const javascript = ts.transpileModule(client, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const helper = javascript.match(
+    /function requireRtcPeerConnection\(\) \{[\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(helper, "compiled WebRTC constructor resolver exists");
+
+  const WindowPeerConnection = class WindowPeerConnection {};
+  const WebkitPeerConnection = class WebkitPeerConnection {};
+  const WrongGlobalPeerConnection = class WrongGlobalPeerConnection {};
+
+  assert.equal(
+    runInNewContext(`${helper}\nrequireRtcPeerConnection();`, {
+      window: {
+        RTCPeerConnection: WindowPeerConnection,
+        webkitRTCPeerConnection: WebkitPeerConnection,
+      },
+      globalThis: { RTCPeerConnection: WrongGlobalPeerConnection },
+    }),
+    WindowPeerConnection,
+  );
+  assert.equal(
+    runInNewContext(`${helper}\nrequireRtcPeerConnection();`, {
+      window: { webkitRTCPeerConnection: WebkitPeerConnection },
+      globalThis: { RTCPeerConnection: WrongGlobalPeerConnection },
+    }),
+    WebkitPeerConnection,
+  );
 });

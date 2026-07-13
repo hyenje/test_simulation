@@ -4,6 +4,10 @@ export type KvsConnectionState = "waiting" | "connecting" | "live" | "offline";
 
 type KvsRole = "MASTER" | "VIEWER";
 
+type WebRtcWindow = typeof window & {
+  webkitRTCPeerConnection?: typeof RTCPeerConnection;
+};
+
 type KvsSessionConfig = {
   role: KvsRole;
   region: string;
@@ -322,11 +326,13 @@ function toError(error: unknown, fallback: string) {
   return error instanceof Error ? error : new Error(fallback);
 }
 
-function requireRtcPeerConnection() {
-  const PeerConnection = globalThis.RTCPeerConnection;
+function requireRtcPeerConnection(): typeof RTCPeerConnection {
+  const browserWindow = window as WebRtcWindow;
+  const PeerConnection =
+    browserWindow.RTCPeerConnection ?? browserWindow.webkitRTCPeerConnection;
   if (typeof PeerConnection !== "function") {
     throw new Error(
-      "현재 브라우저는 WebRTC 실시간 영상을 지원하지 않습니다. 이 주소를 Chrome, Safari 또는 Edge에서 열어 주세요.",
+      "WebRTC 연결 기능을 찾지 못했습니다. AdGuard 등 확장 프로그램의 WebRTC 차단을 끈 뒤 새로고침해 주세요.",
     );
   }
   return PeerConnection;
