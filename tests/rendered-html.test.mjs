@@ -20,6 +20,11 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const client = await readFile(new URL("../app/lib/kvs-client.ts", import.meta.url), "utf8");
   const route = await readFile(new URL("../app/api/kvs/session/route.ts", import.meta.url), "utf8");
+  const sessionsRoute = await readFile(
+    new URL("../app/api/live-sessions/route.ts", import.meta.url),
+    "utf8",
+  );
+  const database = await readFile(new URL("../db/petcam.ts", import.meta.url), "utf8");
   const broker = await readFile(new URL("../infra/aws/kvs-broker/index.mjs", import.meta.url), "utf8");
   const hosting = JSON.parse(await readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"));
 
@@ -35,7 +40,19 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   assert.doesNotMatch(client, /globalThis\.RTCPeerConnection/);
   assert.doesNotMatch(client, /new RTCPeerConnection\(/);
   assert.match(client, /\/api\/kvs\/session/);
-  assert.match(route, /getAuthorizedSession/);
+  assert.match(route, /getAuthorizedMasterSession/);
+  assert.match(route, /getPasswordAuthorizedViewerSession/);
+  assert.match(route, /role === "MASTER"/);
+  assert.match(route, /viewerPassword/);
+  assert.match(route, /consumeRequestRateLimit/);
+  assert.match(route, /limit: 5/);
+  assert.match(route, /limit: 10/);
+  assert.match(route, /"retry-after": "60"/);
+  assert.match(sessionsRoute, /canBroadcastForConfiguredAccount/);
+  assert.match(sessionsRoute, /PETCAM_SHARE_SECRET/);
+  assert.match(database, /stream_session_access/);
+  assert.match(database, /eq\(streamSessions\.startedBy, userEmail\)/);
+  assert.doesNotMatch(database, /INSERT INTO device_memberships/);
   assert.match(broker, /GetSignalingChannelEndpointCommand/);
   assert.match(broker, /GetIceServerConfigCommand/);
   assert.match(page, /audio:\s*false/);
@@ -44,12 +61,17 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   assert.match(page, /보호자 1명/);
   assert.match(page, /원본 저장 없음/);
   assert.match(page, /AWS KVS · PRIVATE/);
+  assert.match(page, /시청 비밀번호/);
+  assert.match(page, /코드\+비밀번호 시청/);
+  assert.match(page, /ID 로그인/);
   assert.equal(hosting.d1, "DB");
   assert.equal(hosting.r2, null);
 
   const browserSource = `${page}\n${client}`;
   assert.doesNotMatch(browserSource, /BroadcastChannel|LiveKit|MediaRecorder|localStorage/);
   assert.doesNotMatch(browserSource, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AKIA[0-9A-Z]{16}/);
+  const viewerUrlHelper = page.match(/function viewerUrl\([\s\S]*?\n\}/)?.[0] ?? "";
+  assert.doesNotMatch(viewerUrlHelper, /viewerPassword|시청 비밀번호/);
 
   const javascript = ts.transpileModule(client, {
     compilerOptions: {

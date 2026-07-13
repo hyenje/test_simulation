@@ -1,10 +1,7 @@
-// Intentionally empty by default.
-// Add Drizzle tables here when the site actually needs a database.
-// See examples/d1/db/schema.ts for an opt-in example.
-export {};
 import { sql } from "drizzle-orm";
 import {
   index,
+  integer,
   primaryKey,
   sqliteTable,
   text,
@@ -57,3 +54,18 @@ export const streamSessions = sqliteTable(
     index("stream_sessions_device_status_idx").on(table.deviceId, table.status),
   ],
 );
+
+export const streamSessionAccess = sqliteTable("stream_session_access", {
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => streamSessions.id, { onDelete: "cascade" }),
+  secretDigest: text("secret_digest").notNull(),
+  authVersion: text("auth_version").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const requestRateLimits = sqliteTable("request_rate_limits", {
+  rateKey: text("rate_key").primaryKey(),
+  windowStartedAt: integer("window_started_at").notNull(),
+  requestCount: integer("request_count").notNull(),
+});

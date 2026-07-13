@@ -43,6 +43,15 @@ function normalizeRoomCode(value: string) {
   return value.replace(/[^A-HJ-NP-Z2-9]/gi, "").slice(0, 6).toUpperCase();
 }
 
+function normalizeViewerPassword(value: string) {
+  const raw = value.replace(/[^A-HJ-NP-Z2-9]/gi, "").slice(0, 16).toUpperCase();
+  return raw.match(/.{1,4}/g)?.join("-") ?? raw;
+}
+
+function isCompleteViewerPassword(value: string) {
+  return value.replace(/-/g, "").length === 16;
+}
+
 function viewerUrl(roomCode: string) {
   const url = new URL(window.location.href);
   url.search = "";
@@ -60,7 +69,15 @@ function StatusBadge({ state }: { state: ConnectionState }) {
   );
 }
 
-function Broadcaster({ roomCode, onExit }: { roomCode: string; onExit: () => void }) {
+function Broadcaster({
+  roomCode,
+  viewerPassword,
+  onExit,
+}: {
+  roomCode: string;
+  viewerPassword: string;
+  onExit: () => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const connectionRef = useRef<KvsConnection | null>(null);
@@ -178,8 +195,10 @@ function Broadcaster({ roomCode, onExit }: { roomCode: string; onExit: () => voi
     }
   };
 
-  const copyViewerLink = async () => {
-    await navigator.clipboard.writeText(viewerUrl(roomCode));
+  const copyViewerInvite = async () => {
+    await navigator.clipboard.writeText(
+      `${viewerUrl(roomCode)}\n세션 코드: ${roomCode}\n시청 비밀번호: ${viewerPassword}`,
+    );
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
   };
@@ -244,11 +263,15 @@ function Broadcaster({ roomCode, onExit }: { roomCode: string; onExit: () => voi
 
         <aside className="control-panel">
           <div className="panel-card room-card">
-            <span className="card-label">활성 세션 코드</span>
+            <span className="card-label">보호자 접속 정보</span>
             <strong className="room-code" data-testid="room-code">{roomCode}</strong>
-            <p>코드는 세션을 찾는 값이며 권한 수단이 아닙니다. 로그인과 기기 소유권을 서버에서 확인합니다.</p>
-            <button className="text-button" onClick={copyViewerLink}>
-              {copied ? "링크를 복사했어요" : "보호자 링크 복사"}
+            <span className="password-label">시청 비밀번호</span>
+            <strong className="viewer-password" data-testid="viewer-password">
+              {viewerPassword}
+            </strong>
+            <p>링크에는 코드만 포함됩니다. 보호자는 ID 로그인 후 코드와 비밀번호를 모두 입력해야 합니다.</p>
+            <button className="text-button" onClick={copyViewerInvite}>
+              {copied ? "초대 정보를 복사했어요" : "보호자 초대 정보 복사"}
             </button>
           </div>
 
@@ -277,7 +300,15 @@ function Broadcaster({ roomCode, onExit }: { roomCode: string; onExit: () => voi
   );
 }
 
-function Viewer({ roomCode, onExit }: { roomCode: string; onExit: () => void }) {
+function Viewer({
+  roomCode,
+  viewerPassword,
+  onExit,
+}: {
+  roomCode: string;
+  viewerPassword: string;
+  onExit: () => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const connectionRef = useRef<KvsConnection | null>(null);
   const [state, setState] = useState<ConnectionState>("connecting");
@@ -291,6 +322,7 @@ function Viewer({ roomCode, onExit }: { roomCode: string; onExit: () => void }) 
 
     connectKvsViewer({
       roomCode,
+      viewerPassword,
       onStream: (stream) => {
         if (!active || !videoElement) return;
         remoteStream = stream;
@@ -335,7 +367,7 @@ function Viewer({ roomCode, onExit }: { roomCode: string; onExit: () => void }) 
       if (videoElement) videoElement.srcObject = null;
       remoteStream?.getTracks().forEach((track) => track.stop());
     };
-  }, [attempt, roomCode]);
+  }, [attempt, roomCode, viewerPassword]);
 
   return (
     <main className="app-shell viewer-shell">
@@ -390,6 +422,7 @@ function Viewer({ roomCode, onExit }: { roomCode: string; onExit: () => void }) 
             <span className="card-label">세션 정보</span>
             <dl>
               <div><dt>세션 코드</dt><dd>{roomCode}</dd></div>
+              <div><dt>접근 확인</dt><dd>코드 + 비밀번호</dd></div>
               <div><dt>오디오</dt><dd>꺼짐</dd></div>
               <div><dt>녹화</dt><dd>사용 안 함</dd></div>
               <div><dt>연결</dt><dd>AWS KVS WebRTC</dd></div>
@@ -409,7 +442,22 @@ function Header() {
         <span className="brand-mark" aria-hidden="true">P</span>
         <span><strong>PETCAM</strong><small>LIVE LAB</small></span>
       </div>
-      <span className="prototype-chip">AWS KVS WEBRTC · PRIVATE ALPHA</span>
+      <div className="header-actions">
+        <span className="prototype-chip">AWS KVS WEBRTC · PRIVATE ALPHA</span>
+        <a
+          className="login-link"
+          href="/signin-with-chatgpt?return_to=%2F"
+          onClick={(event) => {
+            event.preventDefault();
+            const returnTo = `${window.location.pathname}${window.location.search}`;
+            window.location.assign(
+              `/signin-with-chatgpt?return_to=${encodeURIComponent(returnTo)}`,
+            );
+          }}
+        >
+          ID 로그인
+        </a>
+      </div>
     </header>
   );
 }
@@ -418,6 +466,8 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>("landing");
   const [roomCode, setRoomCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
+  const [viewerPassword, setViewerPassword] = useState("");
+  const [joinPassword, setJoinPassword] = useState("");
   const [creatingSession, setCreatingSession] = useState(false);
   const [landingError, setLandingError] = useState("");
 
@@ -427,9 +477,7 @@ export default function Home() {
     const requestedRoom = normalizeRoomCode(params.get("room") ?? "");
     if (requestedMode === "viewer" && requestedRoom.length === 6) {
       window.queueMicrotask(() => {
-        setRoomCode(requestedRoom);
         setJoinCode(requestedRoom);
-        setMode("viewer");
       });
     }
   }, []);
@@ -438,11 +486,17 @@ export default function Home() {
     window.history.replaceState({}, "", window.location.pathname);
     setMode("landing");
     setRoomCode("");
+    setViewerPassword("");
+    setJoinPassword("");
     setLandingError("");
   };
 
-  if (mode === "broadcaster") return <Broadcaster roomCode={roomCode} onExit={reset} />;
-  if (mode === "viewer") return <Viewer roomCode={roomCode} onExit={reset} />;
+  if (mode === "broadcaster") {
+    return <Broadcaster roomCode={roomCode} viewerPassword={viewerPassword} onExit={reset} />;
+  }
+  if (mode === "viewer") {
+    return <Viewer roomCode={roomCode} viewerPassword={viewerPassword} onExit={reset} />;
+  }
 
   const createBroadcast = async () => {
     if (creatingSession) return;
@@ -451,6 +505,7 @@ export default function Home() {
     try {
       const session = await createLiveSession();
       setRoomCode(session.roomCode);
+      setViewerPassword(session.viewerPassword);
       setMode("broadcaster");
     } catch (reason) {
       setLandingError(reason instanceof Error ? reason.message : "세션을 만들지 못했습니다.");
@@ -461,8 +516,10 @@ export default function Home() {
 
   const joinBroadcast = () => {
     const code = normalizeRoomCode(joinCode);
-    if (code.length !== 6) return;
+    const password = normalizeViewerPassword(joinPassword);
+    if (code.length !== 6 || !isCompleteViewerPassword(password)) return;
     setRoomCode(code);
+    setViewerPassword(password);
     setMode("viewer");
   };
 
@@ -504,7 +561,7 @@ export default function Home() {
             <div>
               <span className="card-label">노트북 또는 로봇 쪽</span>
               <h3>카메라 송출자</h3>
-              <p>영속 세션을 만들고 웹캠을 AWS KVS의 MASTER로 연결합니다.</p>
+              <p>영상 공개 권한을 받은 ID만 영속 세션을 만들고 AWS KVS의 MASTER로 연결합니다.</p>
             </div>
             <button
               className="button primary"
@@ -521,21 +578,41 @@ export default function Home() {
             <div>
               <span className="card-label">보호자 쪽</span>
               <h3>실시간 시청자</h3>
-              <p>로그인 후 활성 세션 코드를 입력해 허가된 펫 카메라를 확인합니다.</p>
+              <p>ID 로그인 후 전달받은 세션 코드와 시청 비밀번호를 모두 입력합니다.</p>
             </div>
-            <div className="join-row">
-              <label>
-                <span className="sr-only">세션 코드</span>
-                <input
-                  value={joinCode}
-                  onChange={(event) => setJoinCode(normalizeRoomCode(event.target.value))}
-                  onKeyDown={(event) => event.key === "Enter" && joinBroadcast()}
-                  placeholder="6자리 코드"
-                  aria-label="세션 코드"
-                  maxLength={6}
-                />
-              </label>
-              <button className="button dark" onClick={joinBroadcast} disabled={joinCode.length !== 6}>
+            <div className="join-fields">
+              <div className="join-row">
+                <label>
+                  <span className="sr-only">세션 코드</span>
+                  <input
+                    value={joinCode}
+                    onChange={(event) => setJoinCode(normalizeRoomCode(event.target.value))}
+                    placeholder="6자리 코드"
+                    aria-label="세션 코드"
+                    autoComplete="one-time-code"
+                    maxLength={6}
+                  />
+                </label>
+                <label className="password-input">
+                  <span className="sr-only">시청 비밀번호</span>
+                  <input
+                    value={joinPassword}
+                    onChange={(event) =>
+                      setJoinPassword(normalizeViewerPassword(event.target.value))
+                    }
+                    onKeyDown={(event) => event.key === "Enter" && joinBroadcast()}
+                    placeholder="시청 비밀번호"
+                    aria-label="시청 비밀번호"
+                    autoComplete="off"
+                    maxLength={19}
+                  />
+                </label>
+              </div>
+              <button
+                className="button dark"
+                onClick={joinBroadcast}
+                disabled={joinCode.length !== 6 || !isCompleteViewerPassword(joinPassword)}
+              >
                 입장
               </button>
             </div>
@@ -545,7 +622,7 @@ export default function Home() {
 
       <footer className="site-footer">
         <span>PRIVATE ALPHA 01</span>
-        <p>AWS KVS WebRTC · 서버 측 권한 검사 · D1 영속 세션 · 영상 녹화 비활성화</p>
+        <p>AWS KVS WebRTC · 송출 ID 권한 · 코드+비밀번호 시청 · 영상 녹화 비활성화</p>
       </footer>
     </main>
   );

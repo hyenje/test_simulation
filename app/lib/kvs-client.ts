@@ -76,7 +76,7 @@ export async function createLiveSession() {
     headers: { "content-type": "application/json" },
   });
   const payload = (await response.json()) as {
-    session?: { roomCode: string };
+    session?: { roomCode: string; viewerPassword: string };
     error?: string;
   };
   if (!response.ok || !payload.session) {
@@ -198,6 +198,7 @@ export async function connectKvsMaster(input: {
 
 export async function connectKvsViewer(input: {
   roomCode: string;
+  viewerPassword: string;
   onStream: (stream: MediaStream) => void;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
@@ -205,7 +206,7 @@ export async function connectKvsViewer(input: {
   const clientId = `petcam-${crypto.randomUUID()}`;
   const [sdk, config] = await Promise.all([
     loadKvsSdk(),
-    requestKvsSession(input.roomCode, "VIEWER", clientId),
+    requestKvsSession(input.roomCode, "VIEWER", clientId, input.viewerPassword),
   ]);
   let closed = false;
   const queuedCandidates: RTCIceCandidateInit[] = [];
@@ -287,11 +288,16 @@ export async function connectKvsViewer(input: {
   };
 }
 
-async function requestKvsSession(roomCode: string, role: KvsRole, clientId?: string) {
+async function requestKvsSession(
+  roomCode: string,
+  role: KvsRole,
+  clientId?: string,
+  viewerPassword?: string,
+) {
   const response = await fetch("/api/kvs/session", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ roomCode, role, clientId }),
+    body: JSON.stringify({ roomCode, role, clientId, viewerPassword }),
   });
   const payload = (await response.json()) as KvsSessionConfig & { error?: string };
   if (!response.ok) throw new Error(payload.error ?? "AWS 연결 정보를 받지 못했습니다.");

@@ -1,12 +1,17 @@
 import { env } from "cloudflare:workers";
 import { createLiveSession, endLiveSession } from "../../../db/petcam";
-import { getRequestUserEmail } from "../../server-auth";
+import {
+  canBroadcastForConfiguredAccount,
+  getRequestUserEmail,
+} from "../../server-auth";
 
 export const dynamic = "force-dynamic";
 
 type SessionEnv = {
   KVS_CHANNEL_ARN?: string;
+  PETCAM_BROADCASTER_EMAILS?: string;
   PETCAM_DEVICE_ID?: string;
+  PETCAM_SHARE_SECRET?: string;
 };
 
 export async function POST(request: Request) {
@@ -16,6 +21,16 @@ export async function POST(request: Request) {
   const runtime = env as unknown as SessionEnv;
   const channelArn = runtime.KVS_CHANNEL_ARN;
   if (!channelArn) return noStore({ error: "AWS 채널 설정이 필요합니다." }, 503);
+  if (!runtime.PETCAM_SHARE_SECRET) {
+    return noStore({ error: "시청 비밀번호 보안 설정이 필요합니다." }, 503);
+  }
+  if (!runtime.PETCAM_BROADCASTER_EMAILS?.trim()) {
+    return noStore({ error: "영상 공개 ID 설정이 필요합니다." }, 503);
+  }
+  const canBroadcast = canBroadcastForConfiguredAccount(ownerEmail);
+  if (!canBroadcast) {
+    return noStore({ error: "이 ID에는 영상 공개 권한이 없습니다." }, 403);
+  }
 
   try {
     const session = await createLiveSession({
@@ -23,6 +38,7 @@ export async function POST(request: Request) {
       deviceId: runtime.PETCAM_DEVICE_ID ?? "laptop-camera-01",
       displayName: "노트북 카메라 01",
       channelArn,
+      shareSecret: runtime.PETCAM_SHARE_SECRET,
     });
     return noStore({ session }, 201);
   } catch (error) {
