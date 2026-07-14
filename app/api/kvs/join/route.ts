@@ -2,13 +2,12 @@ import { env } from "cloudflare:workers";
 import {
   clearRequestRateLimit,
   consumeRequestRateLimit,
-  extendAuthorizedMasterSession,
   getAuthorizedMasterSession,
   getPasswordAuthorizedViewerSession,
   type ActiveSession,
 } from "../../../../db/petcam";
 import { isValidViewerPassword } from "../../../../db/session-secret";
-import { requestBrokerSession, type KvsRole } from "../../../kvs-broker";
+import { requestBrokerJoinStorage, type KvsRole } from "../../../kvs-broker";
 import {
   canBroadcastForConfiguredAccount,
   getRequestUserEmail,
@@ -16,7 +15,7 @@ import {
 
 export const dynamic = "force-dynamic";
 
-type SessionEnv = {
+type JoinEnv = {
   KVS_CHANNEL_ARN?: string;
   KVS_STREAM_ARN?: string;
   PETCAM_SHARE_SECRET?: string;
@@ -52,9 +51,12 @@ export async function POST(request: Request) {
     return noStore({ error: "이 ID에는 영상 공개 권한이 없습니다." }, 403);
   }
 
-  const runtime = env as unknown as SessionEnv;
-  if (!runtime.PETCAM_SHARE_SECRET) {
-    return noStore({ error: "시청 비밀번호 보안 설정이 필요합니다." }, 503);
+  const runtime = env as unknown as JoinEnv;
+  if (!runtime.KVS_STREAM_ARN) {
+    return noStore({ error: "AWS 저장 모드가 활성화되지 않았습니다." }, 409);
+  }
+  if (!runtime.KVS_CHANNEL_ARN || !runtime.PETCAM_SHARE_SECRET) {
+    return noStore({ error: "AWS 저장 연결 설정이 필요합니다." }, 503);
   }
 
   let session: ActiveSession | null;
@@ -84,46 +86,26 @@ export async function POST(request: Request) {
         : "세션 코드 또는 시청 비밀번호가 올바르지 않습니다.";
     return noStore({ error }, 403);
   }
-
-  const storageMode = Boolean(runtime.KVS_STREAM_ARN);
-  if (
-    storageMode &&
-    (!runtime.KVS_CHANNEL_ARN || session.channelArn !== runtime.KVS_CHANNEL_ARN)
-  ) {
+  if (session.channelArn !== runtime.KVS_CHANNEL_ARN) {
     return noStore({ error: "AWS 저장 채널 설정이 일치하지 않습니다." }, 503);
   }
-  if (
-    storageMode &&
-    role === "MASTER" &&
-    !(await extendAuthorizedMasterSession(userEmail, roomCode))
-  ) {
-    return noStore({ error: "세션이 없거나 송출 권한이 없습니다." }, 403);
-  }
 
-  const canIssueCredentials = await consumeRequestRateLimit({
+  const canJoin = await consumeRequestRateLimit({
     userEmail,
     roomCode,
-    scope: `${role.toLowerCase()}-credentials`,
+    scope: `${role.toLowerCase()}-storage-join`,
     limit: 10,
   });
-  if (!canIssueCredentials) return rateLimited();
+  if (!canJoin) return rateLimited();
 
   try {
-    const broker = await requestBrokerSession({ role, clientId });
+    const broker = await requestBrokerJoinStorage({ role, clientId });
     if (broker.channelArn !== session.channelArn) {
-      return noStore({ error: "AWS 채널 설정이 일치하지 않습니다." }, 503);
+      return noStore({ error: "AWS 저장 채널 설정이 일치하지 않습니다." }, 503);
     }
-    return noStore(
-      {
-        ...broker,
-        roomCode,
-        clientId: role === "VIEWER" ? clientId : null,
-        storageMode,
-      },
-      200,
-    );
+    return noStore({ joined: true }, 200);
   } catch {
-    return noStore({ error: "AWS 실시간 연결 정보를 발급하지 못했습니다." }, 503);
+    return noStore({ error: "AWS 저장 세션에 참여하지 못했습니다." }, 503);
   }
 }
 

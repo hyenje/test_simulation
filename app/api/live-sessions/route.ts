@@ -9,6 +9,7 @@ export const dynamic = "force-dynamic";
 
 type SessionEnv = {
   KVS_CHANNEL_ARN?: string;
+  KVS_STREAM_ARN?: string;
   PETCAM_BROADCASTER_EMAILS?: string;
   PETCAM_DEVICE_ID?: string;
   PETCAM_SHARE_SECRET?: string;
@@ -39,6 +40,7 @@ export async function POST(request: Request) {
       displayName: "노트북 카메라 01",
       channelArn,
       shareSecret: runtime.PETCAM_SHARE_SECRET,
+      streamArn: runtime.KVS_STREAM_ARN,
     });
     return noStore({ session }, 201);
   } catch (error) {

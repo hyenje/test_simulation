@@ -13,6 +13,8 @@ test("build contains the AWS pet camera product surface", async () => {
   assert.match(page, /AWS로 실시간 연결/);
   assert.match(page, /AWS 세션 만들기/);
   assert.match(page, /실시간 시청자/);
+  assert.match(page, /양방향 음성/);
+  assert.match(page, /클라우드 7일 보관/);
   assert.doesNotMatch(`${layout}\n${page}`, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -33,13 +35,15 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   assert.match(client, /browserWindow\.RTCPeerConnection/);
   assert.match(client, /browserWindow\.webkitRTCPeerConnection/);
   assert.match(client, /AdGuard 등 확장 프로그램의 WebRTC 차단을 끈 뒤 새로고침해 주세요/);
-  assert.equal(
-    client.match(/new PeerConnection\(\{ iceServers: config\.iceServers \}\)/g)?.length,
-    2,
-  );
+  assert.match(client, /connectKvsStorageParticipant/);
+  assert.match(client, /storageMode/);
+  assert.match(client, /STORAGE_PEER_CONNECT_TIMEOUT_MS = 30_000/);
+  assert.match(client, /sendSdpOffer/);
+  assert.match(client, /sendSdpAnswer/);
   assert.doesNotMatch(client, /globalThis\.RTCPeerConnection/);
   assert.doesNotMatch(client, /new RTCPeerConnection\(/);
   assert.match(client, /\/api\/kvs\/session/);
+  assert.match(client, /\/api\/kvs\/join/);
   assert.match(route, /getAuthorizedMasterSession/);
   assert.match(route, /getPasswordAuthorizedViewerSession/);
   assert.match(route, /role === "MASTER"/);
@@ -51,15 +55,22 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   assert.match(sessionsRoute, /canBroadcastForConfiguredAccount/);
   assert.match(sessionsRoute, /PETCAM_SHARE_SECRET/);
   assert.match(database, /stream_session_access/);
+  assert.match(database, /recording_sessions/);
   assert.match(database, /eq\(streamSessions\.startedBy, userEmail\)/);
   assert.doesNotMatch(database, /INSERT INTO device_memberships/);
   assert.match(broker, /GetSignalingChannelEndpointCommand/);
   assert.match(broker, /GetIceServerConfigCommand/);
-  assert.match(page, /audio:\s*false/);
+  assert.match(broker, /JoinStorageSessionCommand/);
+  assert.match(broker, /JoinStorageSessionAsViewerCommand/);
+  assert.match(page, /echoCancellation:\s*true/);
+  assert.match(page, /localAudioStream/);
   assert.match(page, /startPendingRef/);
   assert.match(page, /addEventListener\(\s*["']ended["']/);
-  assert.match(page, /보호자 1명/);
-  assert.match(page, /원본 저장 없음/);
+  assert.match(page, /addEventListener\(["']loadeddata["']/);
+  assert.match(page, /onPointerDown/);
+  assert.match(page, /window\.addEventListener\(["']pointerup["']/);
+  assert.match(page, /말하기/);
+  assert.match(page, /7일간 저장/);
   assert.match(page, /AWS KVS · PRIVATE/);
   assert.match(page, /시청 비밀번호/);
   assert.match(page, /코드\+비밀번호 시청/);
@@ -105,4 +116,55 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
     }),
     WebkitPeerConnection,
   );
+});
+
+test("protects cloud recordings and issues short-lived HLS playback", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const joinRoute = await readFile(new URL("../app/api/kvs/join/route.ts", import.meta.url), "utf8");
+  const recordingsRoute = await readFile(
+    new URL("../app/api/recordings/route.ts", import.meta.url),
+    "utf8",
+  );
+  const playbackRoute = await readFile(
+    new URL("../app/api/recordings/[recordingId]/playback/route.ts", import.meta.url),
+    "utf8",
+  );
+  const database = await readFile(new URL("../db/petcam.ts", import.meta.url), "utf8");
+  const migration = await readFile(
+    new URL("../drizzle/0003_recording_sessions.sql", import.meta.url),
+    "utf8",
+  );
+  const broker = await readFile(new URL("../infra/aws/kvs-broker/index.mjs", import.meta.url), "utf8");
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+
+  assert.match(joinRoute, /getAuthorizedMasterSession/);
+  assert.match(joinRoute, /getPasswordAuthorizedViewerSession/);
+  assert.match(joinRoute, /storage-join/);
+  assert.match(joinRoute, /cache-control["']:\s*["']no-store/);
+  assert.match(recordingsRoute, /listAuthorizedRecordingSessions/);
+  assert.match(recordingsRoute, /markRecordingStarted/);
+  assert.match(recordingsRoute, /RECORDING_SEGMENT_MS/);
+  assert.match(recordingsRoute, /retentionCutoff/);
+  assert.match(recordingsRoute, /flatMap\(segmentRecording\)/);
+  assert.match(playbackRoute, /getAuthorizedRecordingSession/);
+  assert.match(playbackRoute, /expiresSeconds/);
+  assert.match(playbackRoute, /segmentDurationSeconds/);
+  assert.match(playbackRoute, /404/);
+  assert.match(playbackRoute, /cache-control["']:\s*["']no-store/);
+  assert.match(database, /inArray\(deviceMemberships\.role, BROADCAST_ROLES\)/);
+  assert.match(database, /isNotNull\(recordingSessions\.startedAt\)/);
+  assert.match(database, /isNull\(recordingSessions\.endedAt\)/);
+  assert.match(migration, /FOREIGN KEY.*stream_sessions/);
+  assert.match(broker, /GET_HLS_STREAMING_SESSION_URL/);
+  assert.match(broker, /PlaybackMode:\s*["']ON_DEMAND["']/);
+  assert.match(broker, /maxHlsPlaybackRangeMs = 60 \* 60 \* 1000/);
+  assert.match(broker, /payload\.expiresSeconds > 43_200/);
+  assert.match(broker, /Expires:\s*expiresSeconds/);
+  assert.match(broker, /MaxMediaPlaylistFragmentResults:\s*5000/);
+  assert.match(broker, /ResourceNotFoundException/);
+  assert.match(page, /import\(["']hls\.js["']\)/);
+  assert.match(page, /각 1시간 이하 구간마다/);
+  assert.match(page, /마이크 연결/);
+  assert.match(page, /visibilitychange/);
+  assert.equal(packageJson.dependencies["hls.js"], "1.6.12");
 });

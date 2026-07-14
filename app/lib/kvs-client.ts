@@ -18,6 +18,15 @@ type KvsSessionConfig = {
   expiresAt: string;
   roomCode: string;
   clientId: string | null;
+  storageMode?: boolean;
+};
+
+type KvsStatusResponse = {
+  correlationId?: string;
+  success?: boolean;
+  errorType?: string;
+  statusCode?: string;
+  description?: string;
 };
 
 type KvsSignalingClient = {
@@ -26,7 +35,7 @@ type KvsSignalingClient = {
   on(event: "error", callback: (error: Error) => void): void;
   on(
     event: "sdpOffer",
-    callback: (offer: RTCSessionDescriptionInit, senderClientId: string) => void,
+    callback: (offer: RTCSessionDescriptionInit, senderClientId?: string) => void,
   ): void;
   on(
     event: "sdpAnswer",
@@ -36,12 +45,22 @@ type KvsSignalingClient = {
     event: "iceCandidate",
     callback: (candidate: RTCIceCandidateInit, senderClientId?: string) => void,
   ): void;
+  on(event: "statusResponse", callback: (response: KvsStatusResponse) => void): void;
   open(): void;
   close(): void;
   sendSdpOffer(offer: RTCSessionDescription): void;
-  sendSdpAnswer(answer: RTCSessionDescription, recipientClientId: string): void;
-  sendIceCandidate(candidate: RTCIceCandidate, recipientClientId?: string): void;
+  sendSdpAnswer(
+    answer: RTCSessionDescription,
+    recipientClientId?: string,
+    correlationId?: string,
+  ): void;
+  sendIceCandidate(
+    candidate: RTCIceCandidate,
+    recipientClientId?: string,
+    correlationId?: string,
+  ): void;
   drainPendingIceCandidates(clientId?: string): void;
+  resetIceCandidateState(clientId?: string): void;
 };
 
 type KvsSdk = {
@@ -66,6 +85,7 @@ type ConnectionCallbacks = {
 
 export type KvsConnection = {
   close: () => void;
+  storageMode: boolean;
 };
 
 let sdkPromise: Promise<KvsSdk> | null = null;
@@ -97,6 +117,7 @@ export async function endLiveSession(roomCode: string) {
 export async function connectKvsMaster(input: {
   roomCode: string;
   stream: MediaStream;
+  onRemoteStream?: (stream: MediaStream) => void;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
   const PeerConnection = requireRtcPeerConnection();
@@ -104,6 +125,18 @@ export async function connectKvsMaster(input: {
     loadKvsSdk(),
     requestKvsSession(input.roomCode, "MASTER"),
   ]);
+  if (config.storageMode) {
+    return connectKvsStorageParticipant({
+      role: "MASTER",
+      roomCode: input.roomCode,
+      localStream: input.stream,
+      onRemoteStream: input.onRemoteStream,
+      callbacks: input.callbacks,
+      PeerConnection,
+      sdk,
+      config,
+    });
+  }
   let closed = false;
   let peer: RTCPeerConnection | null = null;
   let remoteClientId: string | null = null;
@@ -188,6 +221,7 @@ export async function connectKvsMaster(input: {
   signaling.open();
 
   return {
+    storageMode: false,
     close() {
       closed = true;
       closePeer();
@@ -199,15 +233,31 @@ export async function connectKvsMaster(input: {
 export async function connectKvsViewer(input: {
   roomCode: string;
   viewerPassword: string;
+  clientId?: string;
+  localAudioStream?: MediaStream;
   onStream: (stream: MediaStream) => void;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
   const PeerConnection = requireRtcPeerConnection();
-  const clientId = `petcam-${crypto.randomUUID()}`;
+  const clientId = input.clientId ?? `petcam-${crypto.randomUUID()}`;
   const [sdk, config] = await Promise.all([
     loadKvsSdk(),
     requestKvsSession(input.roomCode, "VIEWER", clientId, input.viewerPassword),
   ]);
+  if (config.storageMode) {
+    return connectKvsStorageParticipant({
+      role: "VIEWER",
+      roomCode: input.roomCode,
+      viewerPassword: input.viewerPassword,
+      clientId,
+      localStream: input.localAudioStream ?? null,
+      onRemoteStream: input.onStream,
+      callbacks: input.callbacks,
+      PeerConnection,
+      sdk,
+      config,
+    });
+  }
   let closed = false;
   const queuedCandidates: RTCIceCandidateInit[] = [];
   const peer = new PeerConnection({ iceServers: config.iceServers });
@@ -280,6 +330,7 @@ export async function connectKvsViewer(input: {
   signaling.open();
 
   return {
+    storageMode: false,
     close() {
       closed = true;
       signaling.close();
@@ -288,20 +339,438 @@ export async function connectKvsViewer(input: {
   };
 }
 
+const STORAGE_JOIN_MAX_ATTEMPTS = 6;
+const STORAGE_JOIN_RETRY_MS = 6_000;
+const STORAGE_JOIN_TIMEOUT_MS = 6_000;
+const STORAGE_PEER_CONNECT_TIMEOUT_MS = 30_000;
+const STORAGE_RENEW_MS = 55 * 60_000;
+const STORAGE_RENEW_RETRY_MS = 30_000;
+const STORAGE_VIDEO_MAX_BITRATE = 700_000;
+const STORAGE_AUDIO_MAX_BITRATE = 32_000;
+
+type StorageParticipantInput = {
+  role: KvsRole;
+  roomCode: string;
+  viewerPassword?: string;
+  clientId?: string;
+  localStream: MediaStream | null;
+  onRemoteStream?: (stream: MediaStream) => void;
+  callbacks: ConnectionCallbacks;
+  PeerConnection: typeof RTCPeerConnection;
+  sdk: KvsSdk;
+  config: KvsSessionConfig;
+  onReconnectNeeded?: () => void;
+};
+
+function connectKvsStorageParticipant(input: StorageParticipantInput): KvsConnection {
+  if (input.role === "VIEWER") {
+    input.localStream?.getAudioTracks().forEach((track) => {
+      track.enabled = false;
+    });
+  }
+  let closed = false;
+  let generation = 0;
+  let connection: KvsConnection | null = null;
+  let renewalTimer: number | null = null;
+  let renewalAbortController: AbortController | null = null;
+
+  const scheduleRenewal = (delay: number) => {
+    if (closed) return;
+    if (renewalTimer !== null) window.clearTimeout(renewalTimer);
+    renewalTimer = window.setTimeout(() => {
+      renewalTimer = null;
+      void renew();
+    }, delay);
+  };
+
+  const renew = async () => {
+    if (closed) return;
+    const currentGeneration = generation + 1;
+    generation = currentGeneration;
+    input.callbacks.onState("connecting");
+    const controller = new AbortController();
+    renewalAbortController = controller;
+
+    try {
+      const config = await requestKvsSession(
+        input.roomCode,
+        input.role,
+        input.clientId,
+        input.viewerPassword,
+        controller.signal,
+      );
+      if (!config.storageMode) {
+        throw new Error("AWS 저장 모드가 더 이상 활성화되어 있지 않습니다.");
+      }
+      if (closed || generation !== currentGeneration) return;
+
+      connection?.close();
+      connection = null;
+      connection = connectKvsStorageGeneration({
+        ...input,
+        config,
+        onReconnectNeeded: () => scheduleRenewal(0),
+      });
+      scheduleRenewal(STORAGE_RENEW_MS);
+    } catch (error) {
+      if (closed || controller.signal.aborted || generation !== currentGeneration) return;
+      input.callbacks.onError(toError(error, "AWS 저장 연결을 갱신하지 못했습니다."));
+      scheduleRenewal(STORAGE_RENEW_RETRY_MS);
+    } finally {
+      if (renewalAbortController === controller) renewalAbortController = null;
+    }
+  };
+
+  connection = connectKvsStorageGeneration({
+    ...input,
+    onReconnectNeeded: () => scheduleRenewal(0),
+  });
+  scheduleRenewal(STORAGE_RENEW_MS);
+
+  return {
+    storageMode: true,
+    close() {
+      if (closed) return;
+      closed = true;
+      generation += 1;
+      if (renewalTimer !== null) window.clearTimeout(renewalTimer);
+      renewalTimer = null;
+      renewalAbortController?.abort();
+      renewalAbortController = null;
+      connection?.close();
+      connection = null;
+    },
+  };
+}
+
+function connectKvsStorageGeneration(input: StorageParticipantInput): KvsConnection {
+  const localTracks = getStorageLocalTracks(input.role, input.localStream);
+  let closed = false;
+  let peer: RTCPeerConnection | null = null;
+  let remoteStream: MediaStream | null = null;
+  let offerReceived = false;
+  let joinAttempts = 0;
+  let joinRetryTimer: number | null = null;
+  let joinRequestTimer: number | null = null;
+  let joinAbortController: AbortController | null = null;
+  let peerConnectTimer: number | null = null;
+  let reconnectRequested = false;
+  const queuedCandidates: RTCIceCandidateInit[] = [];
+
+  const signaling = new input.sdk.SignalingClient({
+    channelARN: input.config.channelArn,
+    channelEndpoint: input.config.channelEndpoint,
+    clientId: input.role === "VIEWER" ? input.clientId : undefined,
+    role: input.sdk.Role[input.role],
+    region: input.config.region,
+    requestSigner: { getSignedURL: async () => input.config.signedWssUrl },
+    enableEarlyIceCandidateBuffering: true,
+  });
+
+  const clearJoinWork = () => {
+    if (joinRetryTimer !== null) window.clearTimeout(joinRetryTimer);
+    if (joinRequestTimer !== null) window.clearTimeout(joinRequestTimer);
+    joinRetryTimer = null;
+    joinRequestTimer = null;
+    joinAbortController?.abort();
+    joinAbortController = null;
+  };
+
+  const clearPeerConnectTimer = () => {
+    if (peerConnectTimer !== null) window.clearTimeout(peerConnectTimer);
+    peerConnectTimer = null;
+  };
+
+  const closePeer = () => {
+    clearPeerConnectTimer();
+    peer?.close();
+    peer = null;
+    queuedCandidates.length = 0;
+    remoteStream?.getTracks().forEach((track) => track.stop());
+    remoteStream = null;
+  };
+
+  const requestReconnect = () => {
+    if (closed || reconnectRequested) return;
+    reconnectRequested = true;
+    input.callbacks.onState("offline");
+    input.onReconnectNeeded?.();
+  };
+
+  const runJoinAttempt = async () => {
+    if (closed || offerReceived) return;
+    joinAttempts += 1;
+    const controller = new AbortController();
+    joinAbortController = controller;
+    joinRequestTimer = window.setTimeout(() => controller.abort(), STORAGE_JOIN_TIMEOUT_MS);
+    let failure: Error | null = null;
+
+    try {
+      await requestKvsStorageJoin(
+        input.roomCode,
+        input.role,
+        input.clientId,
+        input.viewerPassword,
+        controller.signal,
+      );
+    } catch (error) {
+      failure = toError(error, "AWS 저장 세션 참가 요청에 실패했습니다.");
+    } finally {
+      if (joinRequestTimer !== null) window.clearTimeout(joinRequestTimer);
+      joinRequestTimer = null;
+      if (joinAbortController === controller) joinAbortController = null;
+    }
+
+    if (closed || offerReceived) return;
+    if (joinAttempts >= STORAGE_JOIN_MAX_ATTEMPTS) {
+      input.callbacks.onError(
+        failure ?? new Error("AWS 저장 세션에서 연결 제안을 받지 못했습니다."),
+      );
+      requestReconnect();
+      return;
+    }
+
+    joinRetryTimer = window.setTimeout(() => {
+      joinRetryTimer = null;
+      void runJoinAttempt();
+    }, STORAGE_JOIN_RETRY_MS);
+  };
+
+  signaling.on("open", () => {
+    if (closed) return;
+    input.callbacks.onState("connecting");
+    void runJoinAttempt();
+  });
+
+  signaling.on("sdpOffer", async (offer, senderClientId) => {
+    if (closed || senderClientId) return;
+    offerReceived = true;
+    clearJoinWork();
+    closePeer();
+    input.callbacks.onState("connecting");
+
+    const nextPeer = new input.PeerConnection({ iceServers: input.config.iceServers });
+    const nextRemoteStream = new MediaStream();
+    peer = nextPeer;
+    remoteStream = nextRemoteStream;
+    peerConnectTimer = window.setTimeout(() => {
+      peerConnectTimer = null;
+      if (peer === nextPeer && nextPeer.connectionState !== "connected") {
+        requestReconnect();
+      }
+    }, STORAGE_PEER_CONNECT_TIMEOUT_MS);
+    localTracks.forEach((track) => {
+      if (input.localStream) nextPeer.addTrack(track, input.localStream);
+      else nextPeer.addTrack(track);
+    });
+
+    nextPeer.onicecandidate = ({ candidate }) => {
+      if (
+        !candidate ||
+        closed ||
+        peer !== nextPeer ||
+        isHostIceCandidate(candidate)
+      ) {
+        return;
+      }
+      try {
+        signaling.sendIceCandidate(
+          candidate,
+          undefined,
+          `storage-ice-${crypto.randomUUID()}`,
+        );
+      } catch (error) {
+        input.callbacks.onError(toError(error, "AWS에 ICE 후보를 보내지 못했습니다."));
+      }
+    };
+    nextPeer.ontrack = ({ track }) => {
+      if (closed || peer !== nextPeer) return;
+      if (!nextRemoteStream.getTracks().some((entry) => entry.id === track.id)) {
+        nextRemoteStream.addTrack(track);
+      }
+      input.onRemoteStream?.(nextRemoteStream);
+    };
+    nextPeer.onconnectionstatechange = () => {
+      if (closed || peer !== nextPeer) return;
+      if (nextPeer.connectionState === "connected") {
+        clearPeerConnectTimer();
+        input.callbacks.onState("live");
+      }
+      if (["failed", "disconnected"].includes(nextPeer.connectionState)) {
+        clearPeerConnectTimer();
+        requestReconnect();
+      }
+    };
+
+    try {
+      await nextPeer.setRemoteDescription(offer);
+      if (closed || peer !== nextPeer) return;
+      signaling.drainPendingIceCandidates();
+      for (const candidate of queuedCandidates.splice(0)) {
+        await nextPeer.addIceCandidate(candidate);
+      }
+      preferStorageCodecs(nextPeer);
+      await limitStorageSenders(nextPeer);
+      const answer = await nextPeer.createAnswer();
+      await nextPeer.setLocalDescription(answer);
+      if (closed || peer !== nextPeer || !nextPeer.localDescription) return;
+      signaling.sendSdpAnswer(
+        nextPeer.localDescription,
+        undefined,
+        `storage-answer-${crypto.randomUUID()}`,
+      );
+    } catch (error) {
+      if (closed || peer !== nextPeer) return;
+      input.callbacks.onError(toError(error, "AWS 저장 세션 제안을 처리하지 못했습니다."));
+      requestReconnect();
+    }
+  });
+
+  signaling.on("iceCandidate", (candidate, senderClientId) => {
+    if (closed || senderClientId) return;
+    if (peer?.remoteDescription) {
+      peer.addIceCandidate(candidate).catch((error) => {
+        if (!closed) {
+          input.callbacks.onError(toError(error, "AWS ICE 후보를 적용하지 못했습니다."));
+        }
+      });
+    } else {
+      queuedCandidates.push(candidate);
+    }
+  });
+  signaling.on("statusResponse", (status) => {
+    if (closed || !isFailedStatusResponse(status)) return;
+    input.callbacks.onError(
+      new Error(
+        status.description ??
+          `${status.errorType ?? "AWS signaling error"}${
+            status.statusCode ? ` (${status.statusCode})` : ""
+          }`,
+      ),
+    );
+    if (peer?.connectionState !== "connected") requestReconnect();
+  });
+  signaling.on("close", () => {
+    if (closed) return;
+    clearJoinWork();
+    if (peer?.connectionState !== "connected") requestReconnect();
+  });
+  signaling.on("error", (error) => {
+    if (!closed) {
+      input.callbacks.onError(error);
+      if (peer?.connectionState !== "connected") requestReconnect();
+    }
+  });
+  signaling.open();
+
+  return {
+    storageMode: true,
+    close() {
+      closed = true;
+      clearJoinWork();
+      closePeer();
+      signaling.resetIceCandidateState();
+      signaling.close();
+    },
+  };
+}
+
+function getStorageLocalTracks(role: KvsRole, stream: MediaStream | null) {
+  if (role === "MASTER") {
+    const videoTrack = stream?.getVideoTracks()[0];
+    const audioTrack = stream?.getAudioTracks()[0];
+    if (!videoTrack || !audioTrack) {
+      throw new Error("AWS 영상 저장에는 카메라와 마이크 입력이 모두 필요합니다.");
+    }
+    return [videoTrack, audioTrack];
+  }
+
+  const audioTrack = stream?.getAudioTracks()[0];
+  if (!audioTrack) return [];
+  return [audioTrack];
+}
+
+function preferStorageCodecs(peer: RTCPeerConnection) {
+  for (const transceiver of peer.getTransceivers()) {
+    const kind = transceiver.receiver.track.kind;
+    if (kind !== "video" && kind !== "audio") continue;
+    const mimeType = kind === "video" ? "video/h264" : "audio/opus";
+    const codecs = RTCRtpReceiver.getCapabilities(kind)?.codecs.filter(
+      (codec) => codec.mimeType.toLowerCase() === mimeType,
+    );
+    if (!codecs?.length) {
+      throw new Error(`${kind === "video" ? "H.264" : "Opus"} 코덱을 지원하지 않습니다.`);
+    }
+    transceiver.setCodecPreferences(codecs);
+  }
+}
+
+async function limitStorageSenders(peer: RTCPeerConnection) {
+  for (const sender of peer.getSenders()) {
+    const kind = sender.track?.kind;
+    if (kind !== "video" && kind !== "audio") continue;
+    const parameters = sender.getParameters();
+    if (!parameters.encodings.length) {
+      throw new Error("WebRTC 송출 비트레이트를 제한하지 못했습니다.");
+    }
+    for (const encoding of parameters.encodings) {
+      encoding.maxBitrate =
+        kind === "video" ? STORAGE_VIDEO_MAX_BITRATE : STORAGE_AUDIO_MAX_BITRATE;
+      if (kind === "video") encoding.maxFramerate = 15;
+    }
+    await sender.setParameters(parameters);
+  }
+}
+
+function isHostIceCandidate(candidate: RTCIceCandidate) {
+  return candidate.type === "host" || /\styp host(?:\s|$)/i.test(candidate.candidate);
+}
+
+function isFailedStatusResponse(status: KvsStatusResponse) {
+  if (status.success === false) return true;
+  if (!status.statusCode) return false;
+  const code = Number(status.statusCode);
+  return Number.isFinite(code) && code >= 400;
+}
+
 async function requestKvsSession(
   roomCode: string,
   role: KvsRole,
   clientId?: string,
   viewerPassword?: string,
+  signal?: AbortSignal,
 ) {
   const response = await fetch("/api/kvs/session", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ roomCode, role, clientId, viewerPassword }),
+    signal,
   });
   const payload = (await response.json()) as KvsSessionConfig & { error?: string };
   if (!response.ok) throw new Error(payload.error ?? "AWS 연결 정보를 받지 못했습니다.");
   return payload;
+}
+
+async function requestKvsStorageJoin(
+  roomCode: string,
+  role: KvsRole,
+  clientId: string | undefined,
+  viewerPassword: string | undefined,
+  signal: AbortSignal,
+) {
+  const response = await fetch("/api/kvs/join", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ roomCode, role, clientId, viewerPassword }),
+    signal,
+  });
+  const payload = (await response.json().catch(() => null)) as {
+    joined?: boolean;
+    error?: string;
+  } | null;
+  if (!response.ok || !payload?.joined) {
+    throw new Error(payload?.error ?? "AWS 저장 세션에 참가하지 못했습니다.");
+  }
 }
 
 async function loadKvsSdk(): Promise<KvsSdk> {

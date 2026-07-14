@@ -12,6 +12,18 @@ export type KvsBrokerSession = {
   expiresAt: string;
 };
 
+export type KvsBrokerJoin = {
+  joined: true;
+  role: KvsRole;
+  channelArn: string;
+};
+
+export type KvsBrokerPlayback = {
+  playbackUrl: string;
+  expiresAt: string;
+  streamArn: string;
+};
+
 type BrokerEnv = {
   KVS_BROKER_URL?: string;
   KVS_BROKER_SECRET?: string;
@@ -21,6 +33,66 @@ export async function requestBrokerSession(input: {
   role: KvsRole;
   clientId?: string;
 }): Promise<KvsBrokerSession> {
+  const payload = (await requestBroker(input)) as Partial<KvsBrokerSession>;
+  if (
+    payload.role !== input.role ||
+    typeof payload.region !== "string" ||
+    typeof payload.channelArn !== "string" ||
+    typeof payload.channelEndpoint !== "string" ||
+    typeof payload.signedWssUrl !== "string" ||
+    !Array.isArray(payload.iceServers) ||
+    typeof payload.expiresAt !== "string"
+  ) {
+    throw new Error("KVS_BROKER_RESPONSE_INVALID");
+  }
+
+  return payload as KvsBrokerSession;
+}
+
+export async function requestBrokerJoinStorage(input: {
+  role: KvsRole;
+  clientId?: string;
+}): Promise<KvsBrokerJoin> {
+  const payload = (await requestBroker({
+    action: "JOIN_STORAGE",
+    role: input.role,
+    ...(input.clientId ? { clientId: input.clientId } : {}),
+  })) as Partial<KvsBrokerJoin>;
+  if (
+    payload.joined !== true ||
+    payload.role !== input.role ||
+    typeof payload.channelArn !== "string"
+  ) {
+    throw new Error("KVS_BROKER_RESPONSE_INVALID");
+  }
+  return payload as KvsBrokerJoin;
+}
+
+export async function requestBrokerPlayback(input: {
+  streamArn: string;
+  startAt: string;
+  endAt: string;
+  expiresSeconds: number;
+}): Promise<KvsBrokerPlayback> {
+  const payload = (await requestBroker({
+    action: "HLS_PLAYBACK",
+    streamArn: input.streamArn,
+    startAt: input.startAt,
+    endAt: input.endAt,
+    expiresSeconds: input.expiresSeconds,
+  })) as Partial<KvsBrokerPlayback>;
+  if (
+    typeof payload.playbackUrl !== "string" ||
+    !payload.playbackUrl.startsWith("https://") ||
+    typeof payload.expiresAt !== "string" ||
+    payload.streamArn !== input.streamArn
+  ) {
+    throw new Error("KVS_BROKER_RESPONSE_INVALID");
+  }
+  return payload as KvsBrokerPlayback;
+}
+
+async function requestBroker(input: object) {
   const runtime = env as unknown as BrokerEnv;
   const brokerUrl = runtime.KVS_BROKER_URL;
   const secret = runtime.KVS_BROKER_SECRET;
@@ -42,20 +114,7 @@ export async function requestBrokerSession(input: {
   });
 
   if (!response.ok) throw new Error(`KVS_BROKER_${response.status}`);
-  const payload = (await response.json()) as Partial<KvsBrokerSession>;
-  if (
-    payload.role !== input.role ||
-    typeof payload.region !== "string" ||
-    typeof payload.channelArn !== "string" ||
-    typeof payload.channelEndpoint !== "string" ||
-    typeof payload.signedWssUrl !== "string" ||
-    !Array.isArray(payload.iceServers) ||
-    typeof payload.expiresAt !== "string"
-  ) {
-    throw new Error("KVS_BROKER_RESPONSE_INVALID");
-  }
-
-  return payload as KvsBrokerSession;
+  return response.json();
 }
 
 async function sign(message: string, secret: string) {

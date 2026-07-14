@@ -64,6 +64,21 @@ export const streamSessionAccess = sqliteTable("stream_session_access", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const recordingSessions = sqliteTable(
+  "recording_sessions",
+  {
+    sessionId: text("session_id")
+      .primaryKey()
+      .references(() => streamSessions.id, { onDelete: "cascade" }),
+    kvsStreamArn: text("kvs_stream_arn").notNull(),
+    kvsChannelArn: text("kvs_channel_arn").notNull(),
+    startedAt: text("started_at"),
+    endedAt: text("ended_at"),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [index("recording_sessions_started_at_idx").on(table.startedAt)],
+);
+
 export const requestRateLimits = sqliteTable("request_rate_limits", {
   rateKey: text("rate_key").primaryKey(),
   windowStartedAt: integer("window_started_at").notNull(),
