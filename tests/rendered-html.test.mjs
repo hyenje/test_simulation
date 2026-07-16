@@ -26,6 +26,10 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
     new URL("../app/api/live-sessions/route.ts", import.meta.url),
     "utf8",
   );
+  const authRoute = await readFile(
+    new URL("../app/api/auth/me/route.ts", import.meta.url),
+    "utf8",
+  );
   const database = await readFile(new URL("../db/petcam.ts", import.meta.url), "utf8");
   const broker = await readFile(new URL("../infra/aws/kvs-broker/index.mjs", import.meta.url), "utf8");
   const hosting = JSON.parse(await readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"));
@@ -75,6 +79,13 @@ test("uses AWS KVS signaling without shipping credentials to the browser", async
   assert.match(page, /시청 비밀번호/);
   assert.match(page, /코드\+비밀번호 시청/);
   assert.match(page, /ID 로그인/);
+  assert.match(page, /로그아웃/);
+  assert.match(page, /fetch\(["']\/api\/auth\/me["']/);
+  assert.match(page, /\/signout-with-chatgpt\?return_to=/);
+  assert.match(page, /authenticated\s*\?\s*["']로그아웃["']\s*:\s*["']ID 로그인["']/);
+  assert.match(authRoute, /getRequestUserEmail/);
+  assert.match(authRoute, /authenticated:\s*Boolean/);
+  assert.match(authRoute, /cache-control["']:\s*["']no-store/);
   assert.equal(hosting.d1, "DB");
   assert.equal(hosting.r2, null);
 
@@ -129,6 +140,17 @@ test("protects cloud recordings and issues short-lived HLS playback", async () =
     new URL("../app/api/recordings/[recordingId]/playback/route.ts", import.meta.url),
     "utf8",
   );
+  const playbackProxyRoute = await readFile(
+    new URL(
+      "../app/api/recordings/[recordingId]/hls/[playbackId]/[resource]/route.ts",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const playbackProxy = await readFile(
+    new URL("../app/recording-playback-proxy.ts", import.meta.url),
+    "utf8",
+  );
   const database = await readFile(new URL("../db/petcam.ts", import.meta.url), "utf8");
   const migration = await readFile(
     new URL("../drizzle/0003_recording_sessions.sql", import.meta.url),
@@ -151,6 +173,20 @@ test("protects cloud recordings and issues short-lived HLS playback", async () =
   assert.match(playbackRoute, /segmentDurationSeconds/);
   assert.match(playbackRoute, /404/);
   assert.match(playbackRoute, /cache-control["']:\s*["']no-store/);
+  assert.match(playbackRoute, /createRecordingPlaybackProxy/);
+  assert.match(playbackRoute, /set-cookie/);
+  assert.match(playbackProxyRoute, /resolveRecordingPlaybackProxy/);
+  assert.match(playbackProxyRoute, /redirect:\s*["']manual["']/);
+  assert.match(playbackProxyRoute, /private, no-store/);
+  assert.match(playbackProxyRoute, /cross-origin-resource-policy/);
+  assert.doesNotMatch(playbackProxyRoute, /getAuthorizedRecordingSession|consumeRequestRateLimit/);
+  assert.match(playbackProxy, /\.kinesisvideo\\\.ap-northeast-2\\\.amazonaws\\\.com/);
+  assert.match(playbackProxy, /AES-GCM/);
+  assert.match(playbackProxy, /HKDF/);
+  assert.match(playbackProxy, /HttpOnly/);
+  assert.match(playbackProxy, /SameSite=Strict/);
+  assert.match(playbackProxy, /rewriteRecordingPlaylist/);
+  assert.match(playbackProxy, /searchParams\.delete\(["']SessionToken["']\)/);
   assert.match(database, /inArray\(deviceMemberships\.role, BROADCAST_ROLES\)/);
   assert.match(database, /isNotNull\(recordingSessions\.startedAt\)/);
   assert.match(database, /isNull\(recordingSessions\.endedAt\)/);
@@ -163,6 +199,16 @@ test("protects cloud recordings and issues short-lived HLS playback", async () =
   assert.match(broker, /MaxMediaPlaylistFragmentResults:\s*5000/);
   assert.match(broker, /ResourceNotFoundException/);
   assert.match(page, /import\(["']hls\.js["']\)/);
+  assert.match(page, /Hls\.Events\.ERROR/);
+  assert.match(page, /Hls\.Events\.MANIFEST_PARSED/);
+  assert.match(page, /Hls\.ErrorTypes\.NETWORK_ERROR/);
+  assert.match(page, /data\.fatal/);
+  assert.match(page, /NotAllowedError/);
+  assert.match(page, /addEventListener\(["']canplay["']/);
+  assert.match(page, /addEventListener\(["']error["']/);
+  assert.match(page, /녹화 영상을 불러오는 중입니다/);
+  assert.match(page, /재생하기/);
+  assert.doesNotMatch(page, /video\.play\(\)\.catch\(\(\) => undefined\)/);
   assert.match(page, /각 1시간 이하 구간마다/);
   assert.match(page, /마이크 연결/);
   assert.match(page, /visibilitychange/);

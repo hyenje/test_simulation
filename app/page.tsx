@@ -54,6 +54,8 @@ type Recording = {
   status: string;
 };
 
+type RecordingPlaybackState = "loading" | "ready" | "autoplay-blocked" | "error";
+
 const STATE_COPY: Record<ConnectionState, string> = {
   idle: "준비 전",
   preparing: "카메라 준비 중",
@@ -129,14 +131,93 @@ function StatusBadge({ state }: { state: ConnectionState }) {
 
 function RecordingPlayer({ recording, onClose }: { recording: Recording; onClose: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const playbackRequestRef = useRef(0);
+  const [playbackState, setPlaybackState] = useState<RecordingPlaybackState>("loading");
   const [error, setError] = useState("");
 
+  const playRecording = useCallback(async (requestId = playbackRequestRef.current) => {
+    const video = videoRef.current;
+    if (!video || requestId !== playbackRequestRef.current) return;
+
+    try {
+      await video.play();
+      if (requestId !== playbackRequestRef.current) return;
+      setError("");
+      setPlaybackState("ready");
+    } catch (reason) {
+      if (requestId !== playbackRequestRef.current) return;
+      if (reason instanceof Error && reason.name === "AbortError") return;
+      if (reason instanceof Error && reason.name === "NotAllowedError") {
+        setPlaybackState("autoplay-blocked");
+        return;
+      }
+      playbackRequestRef.current += 1;
+      setError("녹화를 재생하지 못했습니다.");
+      setPlaybackState("error");
+    }
+  }, []);
+
   useEffect(() => {
+    const requestId = playbackRequestRef.current + 1;
+    playbackRequestRef.current = requestId;
     const controller = new AbortController();
     const video = videoRef.current;
     let dispose = () => undefined;
+    let loadTimer: number | undefined;
 
     if (!video) return () => controller.abort();
+
+    const clearLoadTimer = () => {
+      if (loadTimer === undefined) return;
+      window.clearTimeout(loadTimer);
+      loadTimer = undefined;
+    };
+    const fail = (message: string) => {
+      if (requestId !== playbackRequestRef.current) return;
+      playbackRequestRef.current += 1;
+      clearLoadTimer();
+      setError(message);
+      setPlaybackState("error");
+    };
+    const armLoadTimer = () => {
+      clearLoadTimer();
+      loadTimer = window.setTimeout(() => {
+        fail("녹화 영상을 불러오는 데 시간이 오래 걸리고 있습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.");
+      }, 20_000);
+    };
+    const markReady = () => {
+      if (requestId !== playbackRequestRef.current) return;
+      clearLoadTimer();
+      setError("");
+      setPlaybackState((current) => current === "autoplay-blocked" ? current : "ready");
+    };
+    const handleCanPlay = () => {
+      markReady();
+      void playRecording(requestId);
+    };
+    const handlePlaying = () => {
+      if (requestId !== playbackRequestRef.current) return;
+      clearLoadTimer();
+      setError("");
+      setPlaybackState("ready");
+    };
+    const handleWaiting = () => {
+      if (requestId !== playbackRequestRef.current || video.paused) return;
+      setPlaybackState("loading");
+      armLoadTimer();
+    };
+    const handleMediaError = () => {
+      fail("녹화 영상을 불러오지 못했거나 이 브라우저가 영상 형식을 지원하지 않습니다.");
+    };
+
+    video.addEventListener("canplay", handleCanPlay);
+    video.addEventListener("playing", handlePlaying);
+    video.addEventListener("waiting", handleWaiting);
+    video.addEventListener("stalled", handleWaiting);
+    video.addEventListener("error", handleMediaError);
+    setError("");
+    setPlaybackState("loading");
+    armLoadTimer();
 
     void (async () => {
       try {
@@ -154,37 +235,61 @@ function RecordingPlayer({ recording, onClose }: { recording: Recording; onClose
 
         if (video.canPlayType("application/vnd.apple.mpegurl")) {
           video.src = payload.playbackUrl;
-          dispose = () => {
-            video.pause();
-            video.removeAttribute("src");
-            video.load();
-          };
+          video.load();
         } else {
           const { default: Hls } = await import("hls.js");
           if (controller.signal.aborted) return;
           if (!Hls.isSupported()) throw new Error("이 브라우저는 HLS 녹화 재생을 지원하지 않습니다.");
           const player = new Hls({ enableWorker: true });
+          player.on(Hls.Events.ERROR, (_event, data) => {
+            if (!data.fatal || controller.signal.aborted) return;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              fail("녹화 데이터를 불러오지 못했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.");
+              return;
+            }
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              fail("이 브라우저에서 녹화 영상 형식을 해석하지 못했습니다.");
+              return;
+            }
+            fail("녹화 재생 중 오류가 발생했습니다.");
+          });
+          player.on(Hls.Events.MANIFEST_PARSED, () => {
+            void playRecording(requestId);
+          });
           player.loadSource(payload.playbackUrl);
           player.attachMedia(video);
           dispose = () => player.destroy();
         }
-
-        await video.play().catch(() => undefined);
       } catch (reason) {
         if (!controller.signal.aborted) {
-          setError(reason instanceof Error ? reason.message : "녹화를 재생하지 못했습니다.");
+          fail(reason instanceof Error ? reason.message : "녹화를 재생하지 못했습니다.");
         }
       }
     })();
 
     return () => {
       controller.abort();
+      if (requestId === playbackRequestRef.current) playbackRequestRef.current += 1;
+      clearLoadTimer();
+      video.removeEventListener("canplay", handleCanPlay);
+      video.removeEventListener("playing", handlePlaying);
+      video.removeEventListener("waiting", handleWaiting);
+      video.removeEventListener("stalled", handleWaiting);
+      video.removeEventListener("error", handleMediaError);
       dispose();
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
     };
-  }, [recording.id, recording.segment]);
+  }, [playRecording, recording.id, recording.segment]);
 
   return (
-    <div className="recording-player" role="region" aria-label="클라우드 녹화 재생">
+    <div
+      className="recording-player"
+      role="region"
+      aria-label="클라우드 녹화 재생"
+      aria-busy={playbackState === "loading"}
+    >
       <div className="recording-player-heading">
         <div>
           <span className="card-label">CLOUD PLAYBACK</span>
@@ -193,8 +298,19 @@ function RecordingPlayer({ recording, onClose }: { recording: Recording; onClose
         <button className="text-button" onClick={onClose}>닫기</button>
       </div>
       <video ref={videoRef} controls playsInline data-testid="recording-video" />
-      {error && <p className="error-message" role="alert">{error}</p>}
-      <p className="recording-token-note">각 1시간 이하 구간마다 재생 시간과 여유 시간만큼 유효한 비공개 AWS 주소를 새로 발급합니다.</p>
+      {playbackState === "loading" && (
+        <p className="recording-playback-status" role="status">녹화 영상을 불러오는 중입니다…</p>
+      )}
+      {playbackState === "autoplay-blocked" && (
+        <div className="recording-playback-action">
+          <p>브라우저가 자동 재생을 막았습니다.</p>
+          <button type="button" className="button secondary compact" onClick={() => void playRecording()}>
+            재생하기
+          </button>
+        </div>
+      )}
+      {playbackState === "error" && error && <p className="error-message" role="alert">{error}</p>}
+      <p className="recording-token-note">각 1시간 이하 구간마다 재생 시간과 여유 시간만큼 유효한 비공개 재생 세션을 새로 발급합니다.</p>
     </div>
   );
 }
@@ -1007,6 +1123,30 @@ function Viewer({
 }
 
 function Header() {
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    void fetch("/api/auth/me", {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) return false;
+        const payload = (await response.json()) as { authenticated?: boolean };
+        return payload.authenticated === true;
+      })
+      .then((isAuthenticated) => {
+        if (!controller.signal.aborted) setAuthenticated(isAuthenticated);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setAuthenticated(false);
+      });
+
+    return () => controller.abort();
+  }, []);
+
   return (
     <header className="site-header">
       <div className="brand">
@@ -1015,19 +1155,31 @@ function Header() {
       </div>
       <div className="header-actions">
         <span className="prototype-chip">AWS KVS WEBRTC · PRIVATE ALPHA</span>
-        <a
-          className="login-link"
-          href="/signin-with-chatgpt?return_to=%2F"
-          onClick={(event) => {
-            event.preventDefault();
-            const returnTo = `${window.location.pathname}${window.location.search}`;
-            window.location.assign(
-              `/signin-with-chatgpt?return_to=${encodeURIComponent(returnTo)}`,
-            );
-          }}
-        >
-          ID 로그인
-        </a>
+        {authenticated === null ? (
+          <span className="login-link auth-loading" aria-live="polite">
+            로그인 확인 중
+          </span>
+        ) : (
+          <a
+            className="login-link"
+            href={
+              authenticated
+                ? "/signout-with-chatgpt?return_to=%2F"
+                : "/signin-with-chatgpt?return_to=%2F"
+            }
+            onClick={(event) => {
+              event.preventDefault();
+              const returnTo = `${window.location.pathname}${window.location.search}`;
+              const action = authenticated ? "signout" : "signin";
+              window.location.assign(
+                `/${action}-with-chatgpt?return_to=${encodeURIComponent(returnTo)}`,
+              );
+            }}
+            data-testid="auth-action"
+          >
+            {authenticated ? "로그아웃" : "ID 로그인"}
+          </a>
+        )}
       </div>
     </header>
   );

@@ -4,11 +4,13 @@ import {
   getAuthorizedRecordingSession,
 } from "../../../../../db/petcam";
 import { requestBrokerPlayback } from "../../../../kvs-broker";
+import { createRecordingPlaybackProxy } from "../../../../recording-playback-proxy";
 import { getRequestUserEmail } from "../../../../server-auth";
 
 export const dynamic = "force-dynamic";
 
 type PlaybackEnv = {
+  KVS_BROKER_SECRET?: string;
   KVS_STREAM_ARN?: string;
 };
 
@@ -102,9 +104,20 @@ export async function POST(
       endAt: new Date(segmentEnd).toISOString(),
       expiresSeconds,
     });
+    const proxy = await createRecordingPlaybackProxy(
+      {
+        requestUrl: request.url,
+        playbackUrl: playback.playbackUrl,
+        recordingId,
+        userEmail,
+        expiresAt: playback.expiresAt,
+      },
+      runtime.KVS_BROKER_SECRET ?? "",
+    );
     return noStore(
-      { playbackUrl: playback.playbackUrl, expiresAt: playback.expiresAt },
+      { playbackUrl: proxy.playbackUrl, expiresAt: playback.expiresAt },
       200,
+      { "set-cookie": proxy.setCookie },
     );
   } catch (error) {
     if (error instanceof Error && error.message === "KVS_BROKER_404") {
@@ -114,10 +127,12 @@ export async function POST(
   }
 }
 
-function noStore(body: unknown, status: number) {
+function noStore(body: unknown, status: number, headers?: HeadersInit) {
+  const responseHeaders = new Headers(headers);
+  responseHeaders.set("cache-control", "no-store");
   return Response.json(body, {
     status,
-    headers: { "cache-control": "no-store" },
+    headers: responseHeaders,
   });
 }
 

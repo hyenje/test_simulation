@@ -25,6 +25,7 @@
 AWS KVS WebRTC Storage Session
         ├── 실시간 혼합 영상·음성 ── 보호자 브라우저 (VIEWER)
         └── Kinesis Video Stream ── 7일 보존 ── 1시간 이하 HLS 구간
+                                      └── Sites same-origin proxy ── 녹화 재생
 
 D1
 ├── devices / device_memberships
@@ -34,7 +35,7 @@ D1
 
 Storage Session에서는 MASTER와 VIEWER가 모두 AWS가 보내는 SDP offer에 answer합니다. MASTER는 카메라 영상과 로봇 쪽 마이크를 보내고 보호자 혼합 음성을 받습니다. VIEWER는 마이크 권한 없이 영상·음성부터 연결합니다. 사용자가 `마이크 연결`을 선택하면 권한을 요청하고 같은 viewer client ID로 재협상한 뒤, `말하기` 버튼으로 비활성 audio track만 켜고 끕니다.
 
-브라우저나 Sites 런타임에는 AWS IAM Access Key를 저장하지 않습니다. Sites API가 로그인·세션·비밀번호·rate limit을 확인한 다음 HMAC으로 Lambda broker를 호출합니다. Lambda만 최소 권한 실행 역할을 사용해 WSS, TURN, Storage Session 참여, HLS URL을 발급합니다.
+브라우저나 Sites 런타임에는 AWS IAM Access Key를 저장하지 않습니다. Sites API가 로그인·세션·비밀번호·rate limit을 확인한 다음 HMAC으로 Lambda broker를 호출합니다. Lambda만 최소 권한 실행 역할을 사용해 WSS, TURN, Storage Session 참여, HLS URL을 발급합니다. 녹화 재생 시 AWS 세션 토큰은 짧게 만료되는 암호화·HttpOnly 쿠키에만 두고, 브라우저에는 Sites와 같은 origin의 불투명한 재생 주소를 제공합니다. Sites proxy가 HLS playlist와 MP4 fragment를 스트리밍해 브라우저 CORS 경계를 처리합니다.
 
 ## 권한 경계
 
@@ -42,7 +43,7 @@ Storage Session에서는 MASTER와 VIEWER가 모두 AWS가 보내는 SDP offer�
 - 실시간 시청: 로그인 ID + 세션 코드 + 시청 비밀번호
 - 녹화 목록·재생: 해당 기기의 `owner` 또는 `broadcaster`만 허용
 - 비밀번호: URL·브라우저 저장소에 넣지 않고 D1에는 HMAC 검증값만 저장
-- HLS URL: 서버가 검증한 1시간 이하 구간에만 발급하고, 구간 길이 + 1시간만큼 유효하게 하되 AWS 상한 12시간을 넘기지 않으며 저장·로그하지 않음
+- HLS 재생: 서버가 검증한 1시간 이하 구간에만 발급하고, AWS 세션 토큰은 JSON·클라이언트 URL·브라우저 저장소에 노출하지 않으며 암호화된 HttpOnly 쿠키로만 전달
 - 잘못된 비밀번호: ID·세션별 분당 5회
 - 연결·재생 요청: 목적별 분당 10회
 

@@ -130,6 +130,10 @@ input:focus-visible {
   text-decoration: none;
 }
 
+.auth-loading {
+  opacity: 0.62;
+}
+
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.75fr);
@@ -907,6 +911,24 @@ input:focus-visible {
   max-height: 620px;
   border-radius: 14px;
   background: var(--night);
+}
+
+.recording-playback-status,
+.recording-playback-action {
+  margin: 12px 3px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recording-playback-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.recording-playback-action p {
+  margin: 0;
 }
 
 .recording-token-note {
