@@ -170,7 +170,8 @@ test("protects cloud recordings and issues short-lived HLS playback", async () =
   assert.match(recordingsRoute, /flatMap\(segmentRecording\)/);
   assert.match(playbackRoute, /getAuthorizedRecordingSession/);
   assert.match(playbackRoute, /expiresSeconds/);
-  assert.match(playbackRoute, /segmentDurationSeconds/);
+  assert.match(playbackRoute, /window\.durationSeconds/);
+  assert.match(playbackRoute, /resolveRecordingSegmentWindow/);
   assert.match(playbackRoute, /404/);
   assert.match(playbackRoute, /cache-control["']:\s*["']no-store/);
   assert.match(playbackRoute, /createRecordingPlaybackProxy/);
@@ -179,7 +180,8 @@ test("protects cloud recordings and issues short-lived HLS playback", async () =
   assert.match(playbackProxyRoute, /redirect:\s*["']manual["']/);
   assert.match(playbackProxyRoute, /private, no-store/);
   assert.match(playbackProxyRoute, /cross-origin-resource-policy/);
-  assert.doesNotMatch(playbackProxyRoute, /getAuthorizedRecordingSession|consumeRequestRateLimit/);
+  assert.match(playbackProxyRoute, /getAuthorizedRecordingSession/);
+  assert.doesNotMatch(playbackProxyRoute, /consumeRequestRateLimit/);
   assert.match(playbackProxy, /\.kinesisvideo\\\.ap-northeast-2\\\.amazonaws\\\.com/);
   assert.match(playbackProxy, /AES-GCM/);
   assert.match(playbackProxy, /HKDF/);

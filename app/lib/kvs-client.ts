@@ -139,6 +139,7 @@ export async function connectKvsMaster(input: {
   }
   let closed = false;
   let peer: RTCPeerConnection | null = null;
+  let remoteStream: MediaStream | null = null;
   let remoteClientId: string | null = null;
   const queuedCandidates: Array<{ candidate: RTCIceCandidateInit; sender?: string }> = [];
 
@@ -154,6 +155,8 @@ export async function connectKvsMaster(input: {
   const closePeer = () => {
     peer?.close();
     peer = null;
+    remoteStream?.getTracks().forEach((track) => track.stop());
+    remoteStream = null;
     remoteClientId = null;
     queuedCandidates.length = 0;
   };
@@ -176,6 +179,15 @@ export async function connectKvsMaster(input: {
       if (candidate && remoteClientId === senderClientId) {
         signaling.sendIceCandidate(candidate, senderClientId);
       }
+    };
+    nextPeer.ontrack = (event) => {
+      if (closed || peer !== nextPeer) return;
+      const stream = event.streams[0] ?? remoteStream ?? new MediaStream();
+      if (!stream.getTracks().some((track) => track.id === event.track.id)) {
+        stream.addTrack(event.track);
+      }
+      remoteStream = stream;
+      input.onRemoteStream?.(stream);
     };
     nextPeer.onconnectionstatechange = () => {
       if (nextPeer !== peer || closed) return;
@@ -258,18 +270,87 @@ export async function connectKvsViewer(input: {
       config,
     });
   }
+  return connectKvsP2pViewer({
+    clientId,
+    localAudioStream: input.localAudioStream ?? null,
+    onStream: input.onStream,
+    callbacks: input.callbacks,
+    PeerConnection,
+    sdk,
+    config,
+  });
+}
+
+export async function connectAuthorizedDeviceViewer(input: {
+  deviceId: string;
+  clientId?: string;
+  localAudioStream?: MediaStream;
+  onStream: (stream: MediaStream) => void;
+  callbacks: ConnectionCallbacks;
+}): Promise<KvsConnection> {
+  const PeerConnection = requireRtcPeerConnection();
+  const clientId = input.clientId ?? `homecam-${crypto.randomUUID()}`;
+  const [sdk, config] = await Promise.all([
+    loadKvsSdk(),
+    requestAuthorizedDeviceSession(input.deviceId, clientId, undefined, false),
+  ]);
+  if (config.storageMode) {
+    const refreshConfig = (signal: AbortSignal) =>
+      requestAuthorizedDeviceSession(input.deviceId, clientId, signal, false);
+    return connectKvsStorageParticipant({
+      role: "VIEWER",
+      roomCode: config.roomCode,
+      clientId,
+      localStream: input.localAudioStream ?? null,
+      onRemoteStream: input.onStream,
+      callbacks: input.callbacks,
+      PeerConnection,
+      sdk,
+      config,
+      refreshConfig,
+      requestStorageJoin: async (signal) => {
+        await requestAuthorizedDeviceSession(input.deviceId, clientId, signal, true);
+      },
+    });
+  }
+  return connectKvsP2pViewer({
+    clientId,
+    localAudioStream: input.localAudioStream ?? null,
+    onStream: input.onStream,
+    callbacks: input.callbacks,
+    PeerConnection,
+    sdk,
+    config,
+  });
+}
+
+function connectKvsP2pViewer(input: {
+  clientId: string;
+  localAudioStream: MediaStream | null;
+  onStream: (stream: MediaStream) => void;
+  callbacks: ConnectionCallbacks;
+  PeerConnection: typeof RTCPeerConnection;
+  sdk: KvsSdk;
+  config: KvsSessionConfig;
+}): KvsConnection {
   let closed = false;
   const queuedCandidates: RTCIceCandidateInit[] = [];
-  const peer = new PeerConnection({ iceServers: config.iceServers });
+  const peer = new input.PeerConnection({ iceServers: input.config.iceServers });
   peer.addTransceiver("video", { direction: "recvonly" });
+  const localAudioTrack = input.localAudioStream?.getAudioTracks()[0];
+  if (localAudioTrack && input.localAudioStream) {
+    peer.addTrack(localAudioTrack, input.localAudioStream);
+  } else {
+    peer.addTransceiver("audio", { direction: "recvonly" });
+  }
 
-  const signaling = new sdk.SignalingClient({
-    channelARN: config.channelArn,
-    channelEndpoint: config.channelEndpoint,
-    clientId,
-    role: sdk.Role.VIEWER,
-    region: config.region,
-    requestSigner: { getSignedURL: async () => config.signedWssUrl },
+  const signaling = new input.sdk.SignalingClient({
+    channelARN: input.config.channelArn,
+    channelEndpoint: input.config.channelEndpoint,
+    clientId: input.clientId,
+    role: input.sdk.Role.VIEWER,
+    region: input.config.region,
+    requestSigner: { getSignedURL: async () => input.config.signedWssUrl },
     enableEarlyIceCandidateBuffering: true,
   });
 
@@ -360,6 +441,8 @@ type StorageParticipantInput = {
   sdk: KvsSdk;
   config: KvsSessionConfig;
   onReconnectNeeded?: () => void;
+  refreshConfig?: (signal: AbortSignal) => Promise<KvsSessionConfig>;
+  requestStorageJoin?: (signal: AbortSignal) => Promise<void>;
 };
 
 function connectKvsStorageParticipant(input: StorageParticipantInput): KvsConnection {
@@ -392,13 +475,15 @@ function connectKvsStorageParticipant(input: StorageParticipantInput): KvsConnec
     renewalAbortController = controller;
 
     try {
-      const config = await requestKvsSession(
-        input.roomCode,
-        input.role,
-        input.clientId,
-        input.viewerPassword,
-        controller.signal,
-      );
+      const config = input.refreshConfig
+        ? await input.refreshConfig(controller.signal)
+        : await requestKvsSession(
+            input.roomCode,
+            input.role,
+            input.clientId,
+            input.viewerPassword,
+            controller.signal,
+          );
       if (!config.storageMode) {
         throw new Error("AWS 저장 모드가 더 이상 활성화되어 있지 않습니다.");
       }
@@ -506,13 +591,17 @@ function connectKvsStorageGeneration(input: StorageParticipantInput): KvsConnect
     let failure: Error | null = null;
 
     try {
-      await requestKvsStorageJoin(
-        input.roomCode,
-        input.role,
-        input.clientId,
-        input.viewerPassword,
-        controller.signal,
-      );
+      if (input.requestStorageJoin) {
+        await input.requestStorageJoin(controller.signal);
+      } else {
+        await requestKvsStorageJoin(
+          input.roomCode,
+          input.role,
+          input.clientId,
+          input.viewerPassword,
+          controller.signal,
+        );
+      }
     } catch (error) {
       failure = toError(error, "AWS 저장 세션 참가 요청에 실패했습니다.");
     } finally {
@@ -749,6 +838,34 @@ async function requestKvsSession(
   const payload = (await response.json()) as KvsSessionConfig & { error?: string };
   if (!response.ok) throw new Error(payload.error ?? "AWS 연결 정보를 받지 못했습니다.");
   return payload;
+}
+
+async function requestAuthorizedDeviceSession(
+  deviceId: string,
+  clientId: string,
+  signal?: AbortSignal,
+  joinStorage = false,
+) {
+  const response = await fetch(
+    `/api/devices/${encodeURIComponent(deviceId)}/live-session`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ clientId, joinStorage }),
+      signal,
+    },
+  );
+  const payload = (await response.json().catch(() => null)) as
+    | (KvsSessionConfig & {
+        activeSession?: { roomCode?: string };
+        error?: string;
+      })
+    | null;
+  const roomCode = payload?.activeSession?.roomCode;
+  if (!response.ok || !payload || !roomCode) {
+    throw new Error(payload?.error ?? "홈캠 실시간 연결 정보를 받지 못했습니다.");
+  }
+  return { ...payload, roomCode };
 }
 
 async function requestKvsStorageJoin(

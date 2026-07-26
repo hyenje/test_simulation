@@ -29,6 +29,7 @@ const SESSION_TTL_MS = 60 * 60 * 1000;
 const RECORDING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const BROADCAST_ROLES = ["owner", "broadcaster"];
+const RECORDING_VIEW_ROLES = ["owner", "family", "broadcaster"];
 
 let schemaReady: Promise<void> | null = null;
 
@@ -54,6 +55,7 @@ export type RecordingSessionItem = {
 
 export type AuthorizedRecordingSession = {
   id: string;
+  deviceId: string;
   streamArn: string;
   startedAt: string;
   endedAt: string | null;
@@ -451,7 +453,7 @@ export async function listAuthorizedRecordingSessions(
           isNull(recordingSessions.endedAt),
           gte(recordingSessions.endedAt, retentionCutoff),
         ),
-        inArray(deviceMemberships.role, BROADCAST_ROLES),
+        inArray(deviceMemberships.role, RECORDING_VIEW_ROLES),
       ),
     )
     .orderBy(desc(recordingSessions.startedAt))
@@ -477,6 +479,7 @@ export async function getAuthorizedRecordingSession(
   const [recording] = await db
     .select({
       id: recordingSessions.sessionId,
+      deviceId: streamSessions.deviceId,
       streamArn: recordingSessions.kvsStreamArn,
       startedAt: recordingSessions.startedAt,
       endedAt: recordingSessions.endedAt,
@@ -498,7 +501,7 @@ export async function getAuthorizedRecordingSession(
           isNull(recordingSessions.endedAt),
           gte(recordingSessions.endedAt, retentionCutoff),
         ),
-        inArray(deviceMemberships.role, BROADCAST_ROLES),
+        inArray(deviceMemberships.role, RECORDING_VIEW_ROLES),
       ),
     )
     .limit(1);
@@ -506,6 +509,7 @@ export async function getAuthorizedRecordingSession(
   if (!recording?.startedAt) return null;
   return {
     id: recording.id,
+    deviceId: recording.deviceId,
     streamArn: recording.streamArn,
     startedAt: recording.startedAt,
     endedAt: recording.endedAt,

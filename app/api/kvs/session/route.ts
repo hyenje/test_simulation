@@ -10,15 +10,17 @@ import {
 import { isValidViewerPassword } from "../../../../db/session-secret";
 import { requestBrokerSession, type KvsRole } from "../../../kvs-broker";
 import {
+  resolveDeviceKvsResources,
+  type DeviceKvsEnvironment,
+} from "../../../kvs-device-config";
+import {
   canBroadcastForConfiguredAccount,
   getRequestUserEmail,
 } from "../../../server-auth";
 
 export const dynamic = "force-dynamic";
 
-type SessionEnv = {
-  KVS_CHANNEL_ARN?: string;
-  KVS_STREAM_ARN?: string;
+type SessionEnv = DeviceKvsEnvironment & {
   PETCAM_SHARE_SECRET?: string;
 };
 
@@ -85,11 +87,25 @@ export async function POST(request: Request) {
     return noStore({ error }, 403);
   }
 
-  const storageMode = Boolean(runtime.KVS_STREAM_ARN);
-  if (
-    storageMode &&
-    (!runtime.KVS_CHANNEL_ARN || session.channelArn !== runtime.KVS_CHANNEL_ARN)
-  ) {
+  let resources;
+  try {
+    resources = resolveDeviceKvsResources(runtime, session.deviceId);
+  } catch {
+    return noStore({ error: "AWS 장치 매핑 설정이 올바르지 않습니다." }, 503);
+  }
+  if (!resources) {
+    return noStore({ error: "이 장치의 AWS 리소스가 설정되지 않았습니다." }, 503);
+  }
+  const storageMode = Boolean(
+    resources.streamArn &&
+      resources.storageChannelArn &&
+      session.channelArn === resources.storageChannelArn,
+  );
+  const channelMode = storageMode ? "storage" : "p2p";
+  const expectedChannelArn = storageMode
+    ? resources.storageChannelArn
+    : resources.p2pChannelArn;
+  if (!expectedChannelArn || session.channelArn !== expectedChannelArn) {
     return noStore({ error: "AWS 저장 채널 설정이 일치하지 않습니다." }, 503);
   }
   if (
@@ -109,7 +125,12 @@ export async function POST(request: Request) {
   if (!canIssueCredentials) return rateLimited();
 
   try {
-    const broker = await requestBrokerSession({ role, clientId });
+    const broker = await requestBrokerSession({
+      deviceId: session.deviceId,
+      role,
+      clientId,
+      channelMode,
+    });
     if (broker.channelArn !== session.channelArn) {
       return noStore({ error: "AWS 채널 설정이 일치하지 않습니다." }, 503);
     }

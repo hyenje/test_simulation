@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 
 export type KvsRole = "MASTER" | "VIEWER";
+export type KvsChannelMode = "p2p" | "storage";
 
 export type KvsBrokerSession = {
   role: KvsRole;
@@ -24,16 +25,38 @@ export type KvsBrokerPlayback = {
   streamArn: string;
 };
 
+export type KvsBrokerDeviceCredentials = {
+  role: "MASTER";
+  region: string;
+  channelArn: string;
+  streamArn: string | null;
+  channelMode: KvsChannelMode;
+  credentials: {
+    accessKeyId: string;
+    secretAccessKey: string;
+    sessionToken: string;
+    expiresAt: string;
+  };
+};
+
 type BrokerEnv = {
   KVS_BROKER_URL?: string;
   KVS_BROKER_SECRET?: string;
 };
 
 export async function requestBrokerSession(input: {
+  deviceId: string;
   role: KvsRole;
   clientId?: string;
+  channelMode: KvsChannelMode;
 }): Promise<KvsBrokerSession> {
-  const payload = (await requestBroker(input)) as Partial<KvsBrokerSession>;
+  const payload = (await requestBroker({
+    action: "SESSION",
+    deviceId: input.deviceId,
+    role: input.role,
+    ...(input.clientId ? { clientId: input.clientId } : {}),
+    channelMode: input.channelMode,
+  })) as Partial<KvsBrokerSession>;
   if (
     payload.role !== input.role ||
     typeof payload.region !== "string" ||
@@ -50,13 +73,17 @@ export async function requestBrokerSession(input: {
 }
 
 export async function requestBrokerJoinStorage(input: {
+  deviceId: string;
   role: KvsRole;
   clientId?: string;
+  channelMode: "storage";
 }): Promise<KvsBrokerJoin> {
   const payload = (await requestBroker({
     action: "JOIN_STORAGE",
+    deviceId: input.deviceId,
     role: input.role,
     ...(input.clientId ? { clientId: input.clientId } : {}),
+    ...(input.channelMode ? { channelMode: input.channelMode } : {}),
   })) as Partial<KvsBrokerJoin>;
   if (
     payload.joined !== true ||
@@ -68,7 +95,35 @@ export async function requestBrokerJoinStorage(input: {
   return payload as KvsBrokerJoin;
 }
 
+export async function requestBrokerDeviceCredentials(input: {
+  deviceId: string;
+  channelMode: KvsChannelMode;
+}): Promise<KvsBrokerDeviceCredentials> {
+  const payload = (await requestBroker({
+    action: "DEVICE_CREDENTIALS",
+    deviceId: input.deviceId,
+    channelMode: input.channelMode,
+  })) as Partial<KvsBrokerDeviceCredentials>;
+  const credentials = payload.credentials;
+  if (
+    payload.role !== "MASTER" ||
+    typeof payload.region !== "string" ||
+    typeof payload.channelArn !== "string" ||
+    payload.channelMode !== input.channelMode ||
+    (payload.streamArn !== null && typeof payload.streamArn !== "string") ||
+    !credentials ||
+    typeof credentials.accessKeyId !== "string" ||
+    typeof credentials.secretAccessKey !== "string" ||
+    typeof credentials.sessionToken !== "string" ||
+    typeof credentials.expiresAt !== "string"
+  ) {
+    throw new Error("KVS_BROKER_RESPONSE_INVALID");
+  }
+  return payload as KvsBrokerDeviceCredentials;
+}
+
 export async function requestBrokerPlayback(input: {
+  deviceId: string;
   streamArn: string;
   startAt: string;
   endAt: string;
@@ -76,6 +131,7 @@ export async function requestBrokerPlayback(input: {
 }): Promise<KvsBrokerPlayback> {
   const payload = (await requestBroker({
     action: "HLS_PLAYBACK",
+    deviceId: input.deviceId,
     streamArn: input.streamArn,
     startAt: input.startAt,
     endAt: input.endAt,

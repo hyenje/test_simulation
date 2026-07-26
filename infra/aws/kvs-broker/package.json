@@ -7,6 +7,7 @@
     "@aws-sdk/client-kinesis-video": "3.1085.0",
     "@aws-sdk/client-kinesis-video-archived-media": "3.1085.0",
     "@aws-sdk/client-kinesis-video-webrtc-storage": "3.1085.0",
-    "@aws-sdk/client-kinesis-video-signaling": "3.1085.0"
+    "@aws-sdk/client-kinesis-video-signaling": "3.1085.0",
+    "@aws-sdk/client-sts": "3.1085.0"
   }
 }

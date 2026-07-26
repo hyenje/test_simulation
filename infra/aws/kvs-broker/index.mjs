@@ -17,21 +17,37 @@ import {
   JoinStorageSessionCommand,
   KinesisVideoWebRTCStorageClient,
 } from "@aws-sdk/client-kinesis-video-webrtc-storage";
+import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
+import {
+  loadDeviceResourceConfiguration,
+  resolveConfiguredDevice as resolveDeviceResources,
+} from "./device-config.mjs";
 
 const region = process.env.AWS_REGION;
-const channelArn = process.env.KVS_CHANNEL_ARN;
-const allowedStreamArn = process.env.KVS_STREAM_ARN;
 const sharedSecret = process.env.BROKER_SHARED_SECRET;
+const deviceRoleArn = process.env.KVS_DEVICE_ROLE_ARN;
+const deviceRoleExternalId = process.env.KVS_DEVICE_ROLE_EXTERNAL_ID;
 const kinesisVideo = new KinesisVideoClient({ region });
+const sts = new STSClient({ region });
 const clientIdPattern = /^(?!AWS_)[A-Za-z0-9_-]{1,128}$/;
+const deviceIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const isoTimestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const maxHlsPlaybackRangeMs = 60 * 60 * 1000;
+const deviceResourceConfiguration = loadDeviceResourceConfiguration(
+  process.env,
+  region,
+);
 
 export async function handler(event) {
   if (event.requestContext?.http?.method !== "POST") {
     return response(405, { error: "Method not allowed" });
   }
-  if (!region || !channelArn || !sharedSecret) {
+  if (
+    !region ||
+    !sharedSecret ||
+    deviceResourceConfiguration.error ||
+    !deviceResourceConfiguration.hasAnyDevice
+  ) {
     return response(503, { error: "Broker is not configured" });
   }
 
@@ -53,17 +69,28 @@ export async function handler(event) {
   }
 
   const action = payload.action ?? "SESSION";
-  if (!["SESSION", "JOIN_STORAGE", "HLS_PLAYBACK"].includes(action)) {
+  if (
+    !["SESSION", "JOIN_STORAGE", "HLS_PLAYBACK", "DEVICE_CREDENTIALS"].includes(
+      action,
+    )
+  ) {
     return response(400, { error: "Invalid action" });
   }
 
   if (action === "HLS_PLAYBACK") {
     const input = validateHlsPlaybackInput(payload);
     if (!input) return response(400, { error: "Invalid HLS playback request" });
-    if (!allowedStreamArn) {
+    const resources = resolveDeviceResources(
+      deviceResourceConfiguration,
+      input.deviceId,
+    );
+    if (!resources) {
+      return response(403, { error: "Device is not allowed" });
+    }
+    if (!resources.streamArn) {
       return response(503, { error: "HLS playback is not configured" });
     }
-    if (input.streamArn !== allowedStreamArn) {
+    if (input.streamArn !== resources.streamArn) {
       return response(403, { error: "Stream is not allowed" });
     }
 
@@ -81,13 +108,77 @@ export async function handler(event) {
     }
   }
 
+  if (action === "DEVICE_CREDENTIALS") {
+    const input = validateDeviceCredentialInput(payload);
+    if (!input) return response(400, { error: "Invalid device credential request" });
+    if (!deviceRoleArn) {
+      return response(503, { error: "Device role is not configured" });
+    }
+    const resources = resolveDeviceResources(
+      deviceResourceConfiguration,
+      input.deviceId,
+    );
+    if (!resources) {
+      return response(403, { error: "Device is not allowed" });
+    }
+    const selectedChannelArn = selectChannelArn(resources, input.channelMode);
+    if (!selectedChannelArn) {
+      return response(503, { error: "Requested channel is not configured" });
+    }
+    if (input.channelMode === "storage" && !resources.streamArn) {
+      return response(503, { error: "Storage is not configured" });
+    }
+    try {
+      return response(
+        200,
+        await createDeviceCredentials({
+          ...input,
+          channelArn: selectedChannelArn,
+          streamArn: resources.streamArn,
+        }),
+      );
+    } catch (error) {
+      console.error(
+        "KVS device credential request failed",
+        error instanceof Error ? error.name : "UnknownError",
+      );
+      return response(502, { error: "Device credentials could not be created" });
+    }
+  }
+
   const participant = validateParticipant(payload, payload.action !== undefined);
   if (!participant) return response(400, { error: "Invalid participant" });
+  const channelMode = validateChannelMode(payload.channelMode);
+  if (!channelMode) {
+    return response(400, { error: "Invalid channel mode" });
+  }
+  const resources = resolveDeviceResources(
+    deviceResourceConfiguration,
+    participant.deviceId,
+  );
+  if (!resources) {
+    return response(403, { error: "Device is not allowed" });
+  }
+  const selectedChannelArn = selectChannelArn(resources, channelMode);
+  if (!selectedChannelArn) {
+    return response(503, { error: "Requested channel is not configured" });
+  }
 
   if (action === "JOIN_STORAGE") {
+    if (channelMode !== "storage") {
+      return response(400, { error: "Storage join requires storage channel" });
+    }
     try {
-      await joinStorageSession(participant.role, participant.clientId);
-      return response(200, { joined: true, role: participant.role, channelArn });
+      await joinStorageSession(
+        participant.role,
+        participant.clientId,
+        selectedChannelArn,
+      );
+      return response(200, {
+        joined: true,
+        role: participant.role,
+        channelArn: selectedChannelArn,
+      });
     } catch (error) {
       console.error(
         "KVS storage join failed",
@@ -98,7 +189,11 @@ export async function handler(event) {
   }
 
   try {
-    const session = await createSignalingSession(participant.role, participant.clientId);
+    const session = await createSignalingSession(
+      participant.role,
+      participant.clientId,
+      selectedChannelArn,
+    );
     return response(200, session);
   } catch (error) {
     console.error(
@@ -109,8 +204,8 @@ export async function handler(event) {
   }
 }
 
-async function createSignalingSession(role, clientId) {
-  const endpoints = await getChannelEndpoints(role, ["WSS", "HTTPS"]);
+async function createSignalingSession(role, clientId, channelArn) {
+  const endpoints = await getChannelEndpoints(role, ["WSS", "HTTPS"], channelArn);
   if (!endpoints.WSS || !endpoints.HTTPS) throw new Error("Missing KVS endpoint");
 
   const signaling = new KinesisVideoSignalingClient({
@@ -150,8 +245,8 @@ async function createSignalingSession(role, clientId) {
   };
 }
 
-async function joinStorageSession(role, clientId) {
-  const endpoints = await getChannelEndpoints(role, ["WEBRTC"]);
+async function joinStorageSession(role, clientId, channelArn) {
+  const endpoints = await getChannelEndpoints(role, ["WEBRTC"], channelArn);
   if (!endpoints.WEBRTC) throw new Error("Missing KVS WebRTC endpoint");
 
   const storage = new KinesisVideoWebRTCStorageClient({
@@ -165,6 +260,83 @@ async function joinStorageSession(role, clientId) {
       new JoinStorageSessionAsViewerCommand({ channelArn, clientId }),
     );
   }
+}
+
+async function createDeviceCredentials({
+  deviceId,
+  channelMode,
+  channelArn,
+  streamArn,
+}) {
+  const sessionName = `homecam-${createHash("sha256")
+    .update(deviceId)
+    .digest("hex")
+    .slice(0, 24)}`;
+  const actions = [
+    "kinesisvideo:DescribeSignalingChannel",
+    "kinesisvideo:GetSignalingChannelEndpoint",
+    "kinesisvideo:GetIceServerConfig",
+    "kinesisvideo:ConnectAsMaster",
+  ];
+  if (channelMode === "storage") {
+    actions.push(
+      "kinesisvideo:DescribeMediaStorageConfiguration",
+      "kinesisvideo:JoinStorageSession",
+    );
+  }
+  const statements = [
+    {
+      Effect: "Allow",
+      Action: actions,
+      Resource: channelArn,
+    },
+  ];
+  if (channelMode === "storage") {
+    statements.push({
+      Effect: "Allow",
+      Action: [
+        "kinesisvideo:GetDataEndpoint",
+        "kinesisvideo:DescribeStream",
+        "kinesisvideo:PutMedia",
+      ],
+      Resource: streamArn,
+    });
+  }
+  const policy = JSON.stringify({
+    Version: "2012-10-17",
+    Statement: statements,
+  });
+  const result = await sts.send(
+    new AssumeRoleCommand({
+      RoleArn: deviceRoleArn,
+      RoleSessionName: sessionName,
+      DurationSeconds: 900,
+      Policy: policy,
+      ...(deviceRoleExternalId ? { ExternalId: deviceRoleExternalId } : {}),
+    }),
+  );
+  const credentials = result.Credentials;
+  if (
+    !credentials?.AccessKeyId ||
+    !credentials.SecretAccessKey ||
+    !credentials.SessionToken ||
+    !credentials.Expiration
+  ) {
+    throw new Error("Missing STS credentials");
+  }
+  return {
+    role: "MASTER",
+    region,
+    channelArn,
+    streamArn: channelMode === "storage" ? streamArn : null,
+    channelMode,
+    credentials: {
+      accessKeyId: credentials.AccessKeyId,
+      secretAccessKey: credentials.SecretAccessKey,
+      sessionToken: credentials.SessionToken,
+      expiresAt: credentials.Expiration.toISOString(),
+    },
+  };
 }
 
 async function createHlsPlayback({ streamArn, startAt, endAt, expiresSeconds }) {
@@ -215,7 +387,7 @@ async function createHlsPlayback({ streamArn, startAt, endAt, expiresSeconds }) 
   };
 }
 
-async function getChannelEndpoints(role, protocols) {
+async function getChannelEndpoints(role, protocols, channelArn) {
   const endpointResult = await kinesisVideo.send(
     new GetSignalingChannelEndpointCommand({
       ChannelARN: channelArn,
@@ -233,13 +405,30 @@ async function getChannelEndpoints(role, protocols) {
 }
 
 function validateParticipant(payload, strict) {
-  if (strict && !hasOnlyKeys(payload, ["action", "role", "clientId"])) return null;
+  if (
+    strict &&
+    !hasOnlyKeys(payload, [
+      "action",
+      "deviceId",
+      "role",
+      "clientId",
+      "channelMode",
+    ])
+  ) {
+    return null;
+  }
+  if (
+    typeof payload.deviceId !== "string" ||
+    !deviceIdPattern.test(payload.deviceId)
+  ) {
+    return null;
+  }
   const role = payload.role;
   if (!["MASTER", "VIEWER"].includes(role)) return null;
 
   if (role === "MASTER") {
     if (strict && Object.hasOwn(payload, "clientId")) return null;
-    return { role, clientId: undefined };
+    return { deviceId: payload.deviceId, role, clientId: undefined };
   }
 
   if (typeof payload.clientId !== "string") return null;
@@ -247,13 +436,38 @@ function validateParticipant(payload, strict) {
   if ((strict && clientId !== payload.clientId) || !clientIdPattern.test(clientId)) {
     return null;
   }
-  return { role, clientId };
+  return { deviceId: payload.deviceId, role, clientId };
+}
+
+function validateDeviceCredentialInput(payload) {
+  if (
+    !hasOnlyKeys(payload, ["action", "deviceId", "channelMode"]) ||
+    typeof payload.deviceId !== "string" ||
+    !deviceIdPattern.test(payload.deviceId)
+  ) {
+    return null;
+  }
+  const channelMode = validateChannelMode(payload.channelMode);
+  if (!channelMode) return null;
+  return { deviceId: payload.deviceId, channelMode };
+}
+
+function validateChannelMode(value) {
+  if (value === undefined) return null;
+  return value === "p2p" || value === "storage" ? value : null;
+}
+
+function selectChannelArn(resources, channelMode) {
+  if (channelMode === "p2p") return resources.p2pChannelArn;
+  if (channelMode === "storage") return resources.storageChannelArn;
+  return null;
 }
 
 function validateHlsPlaybackInput(payload) {
   if (
     !hasOnlyKeys(payload, [
       "action",
+      "deviceId",
       "streamArn",
       "startAt",
       "endAt",
@@ -263,6 +477,8 @@ function validateHlsPlaybackInput(payload) {
     return null;
   }
   if (
+    typeof payload.deviceId !== "string" ||
+    !deviceIdPattern.test(payload.deviceId) ||
     typeof payload.streamArn !== "string" ||
     typeof payload.startAt !== "string" ||
     typeof payload.endAt !== "string" ||
@@ -279,6 +495,7 @@ function validateHlsPlaybackInput(payload) {
   const end = Date.parse(payload.endAt);
   if (end <= start || end - start > maxHlsPlaybackRangeMs) return null;
   return {
+    deviceId: payload.deviceId,
     streamArn: payload.streamArn,
     startAt: payload.startAt,
     endAt: payload.endAt,

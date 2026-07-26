@@ -29,6 +29,13 @@
       "when": 1784012183621,
       "tag": "0003_recording_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1785065881856,
+      "tag": "0004_homecam_platform",
+      "breakpoints": true
     }
   ]
 }

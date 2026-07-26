@@ -3,19 +3,22 @@ import {
   consumeRequestRateLimit,
   getAuthorizedRecordingSession,
 } from "../../../../../db/petcam";
+import { writeAuditLog } from "../../../../../db/homecam";
 import { requestBrokerPlayback } from "../../../../kvs-broker";
+import {
+  resolveDeviceKvsResources,
+  type DeviceKvsEnvironment,
+} from "../../../../kvs-device-config";
 import { createRecordingPlaybackProxy } from "../../../../recording-playback-proxy";
+import { resolveRecordingSegmentWindow } from "../../../../recording-segments";
 import { getRequestUserEmail } from "../../../../server-auth";
 
 export const dynamic = "force-dynamic";
 
-type PlaybackEnv = {
+type PlaybackEnv = DeviceKvsEnvironment & {
   KVS_BROKER_SECRET?: string;
-  KVS_STREAM_ARN?: string;
 };
 
-const RECORDING_SEGMENT_MS = 60 * 60 * 1000;
-const RECORDING_RETENTION_MS = 7 * 24 * RECORDING_SEGMENT_MS;
 const HLS_PLAYBACK_BUFFER_SECONDS = 60 * 60;
 
 export async function POST(
@@ -42,51 +45,34 @@ export async function POST(
     return noStore({ error: "올바른 녹화 구간이 필요합니다." }, 400);
   }
 
-  const runtime = env as unknown as PlaybackEnv;
-  if (!runtime.KVS_STREAM_ARN) {
-    return noStore({ error: "AWS 저장 재생 설정이 필요합니다." }, 503);
-  }
-
   const recording = await getAuthorizedRecordingSession(userEmail, recordingId).catch(
     () => null,
   );
-  if (!recording || recording.streamArn !== runtime.KVS_STREAM_ARN) {
+  if (!recording) {
     return noStore({ error: "저장 영상을 찾을 수 없습니다." }, 404);
   }
-  if (!recording.endedAt) {
-    return noStore({ error: "진행 중인 녹화는 실시간 화면에서 확인해 주세요." }, 409);
+  const runtime = env as unknown as PlaybackEnv;
+  let resources;
+  try {
+    resources = resolveDeviceKvsResources(runtime, recording.deviceId);
+  } catch {
+    return noStore({ error: "AWS 장치 매핑 설정이 올바르지 않습니다." }, 503);
   }
-
-  const recordingStart = Date.parse(recording.startedAt);
-  const recordingEnd = Date.parse(recording.endedAt);
-  if (
-    !Number.isFinite(recordingStart) ||
-    !Number.isFinite(recordingEnd) ||
-    recordingEnd <= recordingStart
-  ) {
-    return noStore({ error: "아직 재생할 저장 영상이 없습니다." }, 409);
+  if (!resources?.streamArn) {
+    return noStore({ error: "AWS 저장 재생 설정이 필요합니다." }, 503);
   }
-  const maxSegment = Math.ceil(
-    (recordingEnd - recordingStart) / RECORDING_SEGMENT_MS,
-  ) - 1;
-  if (segment > maxSegment) {
+  if (recording.streamArn !== resources.streamArn) {
     return noStore({ error: "저장 영상을 찾을 수 없습니다." }, 404);
   }
-
-  const requestedSegmentStart = recordingStart + segment * RECORDING_SEGMENT_MS;
-  const segmentEnd = Math.min(
-    recordingEnd,
-    requestedSegmentStart + RECORDING_SEGMENT_MS,
-  );
-  const retentionCutoff = Date.now() - RECORDING_RETENTION_MS;
-  if (segmentEnd <= retentionCutoff) {
-    return noStore({ error: "보관 기간이 지난 녹화입니다." }, 404);
-  }
-  const segmentStart = Math.max(requestedSegmentStart, retentionCutoff);
-  const segmentDurationSeconds = Math.ceil((segmentEnd - segmentStart) / 1000);
+  const window = resolveRecordingSegmentWindow({
+    recordingStartedAt: recording.startedAt,
+    recordingEndedAt: recording.endedAt,
+    segment,
+  });
+  if (!window) return noStore({ error: "저장 영상을 찾을 수 없습니다." }, 404);
   const expiresSeconds = Math.min(
     43_200,
-    Math.max(300, segmentDurationSeconds + HLS_PLAYBACK_BUFFER_SECONDS),
+    Math.max(300, window.durationSeconds + HLS_PLAYBACK_BUFFER_SECONDS),
   );
 
   const canIssuePlayback = await consumeRequestRateLimit({
@@ -99,9 +85,10 @@ export async function POST(
 
   try {
     const playback = await requestBrokerPlayback({
+      deviceId: recording.deviceId,
       streamArn: recording.streamArn,
-      startAt: new Date(segmentStart).toISOString(),
-      endAt: new Date(segmentEnd).toISOString(),
+      startAt: window.startAt,
+      endAt: window.endAt,
       expiresSeconds,
     });
     const proxy = await createRecordingPlaybackProxy(
@@ -114,8 +101,23 @@ export async function POST(
       },
       runtime.KVS_BROKER_SECRET ?? "",
     );
+    await writeAuditLog({
+      deviceId: recording.deviceId,
+      actorType: "user",
+      actorId: userEmail,
+      action: "recording.play",
+      metadata: {
+        recordingId,
+        segment,
+        startAt: window.startAt,
+      },
+    }).catch(() => undefined);
     return noStore(
-      { playbackUrl: proxy.playbackUrl, expiresAt: playback.expiresAt },
+      {
+        playbackUrl: proxy.playbackUrl,
+        expiresAt: playback.expiresAt,
+        seekAdjustmentSeconds: window.trimmedStartSeconds,
+      },
       200,
       { "set-cookie": proxy.setCookie },
     );

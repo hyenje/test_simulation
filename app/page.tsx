@@ -2,6 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  HomecamDashboard,
+  type HomecamDevice,
+} from "./components/homecam-dashboard";
+import {
+  connectAuthorizedDeviceViewer,
   connectKvsMaster,
   connectKvsViewer,
   createLiveSession,
@@ -162,7 +167,7 @@ function RecordingPlayer({ recording, onClose }: { recording: Recording; onClose
     playbackRequestRef.current = requestId;
     const controller = new AbortController();
     const video = videoRef.current;
-    let dispose = () => undefined;
+    let dispose: () => void = () => undefined;
     let loadTimer: number | undefined;
 
     if (!video) return () => controller.abort();
@@ -730,10 +735,14 @@ function Broadcaster({
 function Viewer({
   roomCode,
   viewerPassword,
+  deviceId,
+  device,
   onExit,
 }: {
   roomCode: string;
   viewerPassword: string;
+  deviceId?: string;
+  device?: HomecamDevice;
   onExit: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -741,6 +750,10 @@ function Viewer({
   const connectionRef = useRef<KvsConnection | null>(null);
   const viewerClientIdRef = useRef("");
   const viewerMountedRef = useRef(true);
+  const talkIntentRef = useRef(false);
+  const talkLeaseRef = useRef("");
+  const talkLeaseTimerRef = useRef<number | null>(null);
+  const storageModeRef = useRef<boolean | null>(null);
   const [state, setState] = useState<ConnectionState>("connecting");
   const [attempt, setAttempt] = useState(0);
   const [error, setError] = useState("");
@@ -750,40 +763,96 @@ function Viewer({
     "영상은 바로 연결하고, 말하기를 누를 때만 보호자 마이크 권한을 요청합니다.",
   );
   const [talking, setTalking] = useState(false);
+  const [talkLeasePending, setTalkLeasePending] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(true);
   const [soundBlocked, setSoundBlocked] = useState(false);
   const [storageMode, setStorageMode] = useState<boolean | null>(null);
 
-  const silenceMicrophone = useCallback(() => {
+  const releaseTalkLease = useCallback((notifyServer = true, updateState = true) => {
+    talkIntentRef.current = false;
     const track = microphoneRef.current?.getAudioTracks()[0];
     if (track) track.enabled = false;
-    setTalking(false);
-  }, []);
+    if (talkLeaseTimerRef.current !== null) {
+      window.clearTimeout(talkLeaseTimerRef.current);
+      talkLeaseTimerRef.current = null;
+    }
+    const leaseId = talkLeaseRef.current;
+    talkLeaseRef.current = "";
+    if (notifyServer && deviceId && leaseId) {
+      void fetch(`/api/devices/${encodeURIComponent(deviceId)}/talk-lease`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          leaseId,
+          clientId: viewerClientIdRef.current,
+        }),
+        keepalive: true,
+      }).catch(() => undefined);
+    }
+    if (updateState && viewerMountedRef.current) {
+      setTalking(false);
+      setTalkLeasePending(false);
+    }
+  }, [deviceId]);
 
   useEffect(() => {
     viewerMountedRef.current = true;
     return () => {
       viewerMountedRef.current = false;
+      releaseTalkLease(true, false);
       microphoneRef.current?.getTracks().forEach((track) => track.stop());
       microphoneRef.current = null;
     };
-  }, []);
+  }, [releaseTalkLease]);
 
   useEffect(() => {
+    const handleRelease = () => releaseTalkLease();
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") silenceMicrophone();
+      if (document.visibilityState === "hidden") releaseTalkLease();
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("blur", silenceMicrophone);
-    window.addEventListener("pagehide", silenceMicrophone);
-    window.addEventListener("pointerup", silenceMicrophone);
+    window.addEventListener("blur", handleRelease);
+    window.addEventListener("pagehide", handleRelease);
+    window.addEventListener("pointerup", handleRelease);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("blur", silenceMicrophone);
-      window.removeEventListener("pagehide", silenceMicrophone);
-      window.removeEventListener("pointerup", silenceMicrophone);
+      window.removeEventListener("blur", handleRelease);
+      window.removeEventListener("pagehide", handleRelease);
+      window.removeEventListener("pointerup", handleRelease);
     };
-  }, [silenceMicrophone]);
+  }, [releaseTalkLease]);
+
+  useEffect(() => {
+    if (!deviceId) return;
+    let active = true;
+    const verifyAccess = async () => {
+      try {
+        const response = await fetch(
+          `/api/devices/${encodeURIComponent(deviceId)}/live-session`,
+          { cache: "no-store" },
+        );
+        if (!active || (response.status !== 401 && response.status !== 403)) {
+          return;
+        }
+        releaseTalkLease();
+        connectionRef.current?.close();
+        connectionRef.current = null;
+        microphoneRef.current?.getTracks().forEach((track) => track.stop());
+        microphoneRef.current = null;
+        if (videoRef.current) videoRef.current.srcObject = null;
+        setState("offline");
+        setError("홈캠 접근 권한이 해제되었습니다.");
+      } catch {
+        // Ignore transient access-check failures while healthy media is live.
+      }
+    };
+    window.queueMicrotask(() => void verifyAccess());
+    const interval = window.setInterval(() => void verifyAccess(), 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [deviceId, releaseTalkLease]);
 
   useEffect(() => {
     let active = true;
@@ -797,7 +866,10 @@ function Viewer({
     localAudioStream?.getAudioTracks().forEach((track) => {
       track.enabled = false;
     });
-    if (!viewerClientIdRef.current) {
+    // P2P reconnects use a fresh identity so the master cannot confuse the
+    // new offer with a retiring peer. AWS Storage Session reconnects must
+    // retain the same client ID while the service keeps its viewer quota.
+    if (storageModeRef.current !== true || !viewerClientIdRef.current) {
       viewerClientIdRef.current = `petcam-${crypto.randomUUID()}`;
     }
 
@@ -821,12 +893,10 @@ function Viewer({
 
     void (async () => {
       try {
-        const connection = await connectKvsViewer({
-          roomCode,
-          viewerPassword,
+        const connectionInput = {
           clientId: viewerClientIdRef.current,
           localAudioStream,
-          onStream: (stream) => {
+          onStream: (stream: MediaStream) => {
             if (!active || !videoElement) return;
             remoteStream = stream;
             videoElement.srcObject = stream;
@@ -851,7 +921,7 @@ function Viewer({
               videoTrack.addEventListener("mute", () => {
                 mediaReady = false;
                 if (active && transportLive) {
-                  silenceMicrophone();
+                  releaseTalkLease();
                   setState("connecting");
                 }
               });
@@ -862,7 +932,7 @@ function Viewer({
                   transportLive = false;
                   if (videoElement.srcObject === stream) videoElement.srcObject = null;
                   if (active) {
-                    silenceMicrophone();
+                    releaseTalkLease();
                     setState("offline");
                   }
                 },
@@ -871,7 +941,7 @@ function Viewer({
             }
           },
           callbacks: {
-            onState: (next) => {
+            onState: (next: KvsConnectionState) => {
               if (!active) return;
               if (next === "live") {
                 transportLive = true;
@@ -882,39 +952,45 @@ function Viewer({
               transportLive = false;
               mediaReady = false;
               if (next === "offline" && videoElement) videoElement.srcObject = null;
-              silenceMicrophone();
+              releaseTalkLease();
               setState(next);
             },
-            onError: (reason) => {
+            onError: (reason: Error) => {
               if (!active) return;
               transportLive = false;
               mediaReady = false;
-              silenceMicrophone();
+              releaseTalkLease();
               setError(reason.message || "AWS KVS 연결에 실패했습니다.");
               setState("error");
             },
           },
-        });
+        };
+        const connection = deviceId
+          ? await connectAuthorizedDeviceViewer({
+              deviceId,
+              ...connectionInput,
+            })
+          : await connectKvsViewer({
+              roomCode,
+              viewerPassword,
+              ...connectionInput,
+            });
         localConnection = connection;
         if (!active) {
           connection.close();
         } else {
           setStorageMode(connection.storageMode);
-          if (!connection.storageMode) {
-            if (localAudioStream) {
-              localAudioStream.getTracks().forEach((track) => track.stop());
-              if (microphoneRef.current === localAudioStream) microphoneRef.current = null;
-              setMicrophoneAvailable(false);
-            }
-            setMicrophoneNotice("P2P 폴백 모드는 영상 시청만 지원합니다.");
-          } else if (localAudioStream) {
+          storageModeRef.current = connection.storageMode;
+          if (localAudioStream) {
             setMicrophoneNotice("마이크가 연결되었습니다. 말하기 버튼을 누르는 동안만 전송됩니다.");
+          } else if (!connection.storageMode) {
+            setMicrophoneNotice("P2P 실시간 보기입니다. 말하기를 누를 때만 보호자 마이크를 연결합니다.");
           }
           connectionRef.current = connection;
         }
       } catch (reason) {
         if (!active) return;
-        silenceMicrophone();
+        releaseTalkLease();
         setError(reason instanceof Error ? reason.message : "보호자 화면에 연결하지 못했습니다.");
         setState("error");
       }
@@ -922,6 +998,7 @@ function Viewer({
 
     return () => {
       active = false;
+      releaseTalkLease(true, false);
       localAudioStream?.getAudioTracks().forEach((track) => {
         track.enabled = false;
       });
@@ -933,10 +1010,10 @@ function Viewer({
       }
       remoteStream?.getTracks().forEach((track) => track.stop());
     };
-  }, [attempt, roomCode, silenceMicrophone, viewerPassword]);
+  }, [attempt, deviceId, releaseTalkLease, roomCode, viewerPassword]);
 
   const prepareMicrophone = async () => {
-    if (microphonePending || state !== "live" || storageMode !== true) return;
+    if (microphonePending || state !== "live") return;
     setMicrophonePending(true);
     setMicrophoneNotice("");
 
@@ -977,10 +1054,97 @@ function Viewer({
     }
   };
 
-  const startTalking = () => {
+  const startTalking = async () => {
     const track = microphoneRef.current?.getAudioTracks()[0];
-    if (!track || state !== "live" || storageMode !== true) return;
+    if (!track || state !== "live" || talkLeasePending || talking) return;
+    talkIntentRef.current = true;
+
+    if (deviceId) {
+      setTalkLeasePending(true);
+      try {
+        const response = await fetch(
+          `/api/devices/${encodeURIComponent(deviceId)}/talk-lease`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              clientId: viewerClientIdRef.current,
+            }),
+          },
+        );
+        const payload = (await response.json().catch(() => null)) as {
+          lease?: { leaseId?: string; expiresAt?: string };
+          error?: string;
+        } | null;
+        const leaseId = payload?.lease?.leaseId;
+        if (!response.ok || !leaseId) {
+          throw new Error(
+            response.status === 409
+              ? "다른 가족이 말하고 있어요. 잠시 후 다시 눌러 주세요."
+              : payload?.error ?? "말하기 권한을 받지 못했습니다.",
+          );
+        }
+        talkLeaseRef.current = leaseId;
+        if (!talkIntentRef.current || !viewerMountedRef.current || state !== "live") {
+          releaseTalkLease();
+          return;
+        }
+
+        const renewLease = async () => {
+          const currentLeaseId = talkLeaseRef.current;
+          if (!currentLeaseId || !talkIntentRef.current || !viewerMountedRef.current) return;
+          try {
+            const renewal = await fetch(
+              `/api/devices/${encodeURIComponent(deviceId)}/talk-lease`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  leaseId: currentLeaseId,
+                  clientId: viewerClientIdRef.current,
+                }),
+              },
+            );
+            const renewalPayload = (await renewal.json().catch(() => null)) as {
+              lease?: { leaseId?: string };
+              error?: string;
+            } | null;
+            if (!renewal.ok || renewalPayload?.lease?.leaseId !== currentLeaseId) {
+              throw new Error(renewalPayload?.error ?? "말하기 권한을 갱신하지 못했습니다.");
+            }
+            if (
+              talkLeaseRef.current !== currentLeaseId ||
+              !talkIntentRef.current ||
+              !viewerMountedRef.current
+            ) {
+              return;
+            }
+            talkLeaseTimerRef.current = window.setTimeout(() => void renewLease(), 8_000);
+          } catch (reason) {
+            releaseTalkLease();
+            setMicrophoneNotice(
+              reason instanceof Error ? reason.message : "말하기 연결이 종료되었습니다.",
+            );
+          }
+        };
+        talkLeaseTimerRef.current = window.setTimeout(() => void renewLease(), 8_000);
+      } catch (reason) {
+        talkIntentRef.current = false;
+        setTalkLeasePending(false);
+        setMicrophoneNotice(
+          reason instanceof Error ? reason.message : "말하기 권한을 받지 못했습니다.",
+        );
+        return;
+      }
+    }
+
+    if (!talkIntentRef.current) {
+      releaseTalkLease();
+      return;
+    }
     track.enabled = true;
+    setTalkLeasePending(false);
+    setMicrophoneNotice("");
     setTalking(true);
   };
 
@@ -1006,8 +1170,12 @@ function Viewer({
       <section className="session-heading">
         <div>
           <span className="eyebrow">GUARDIAN VIEW · AWS VIEWER</span>
-          <h1>보호자 실시간 보기</h1>
-          <p>세션 <strong>{roomCode}</strong>의 영상·음성을 보고, 필요할 때 로봇에게 말할 수 있습니다.</p>
+          <h1>우리 집 실시간 보기</h1>
+          <p>
+            {deviceId
+              ? "가족 계정으로 연결된 홈캠을 보고, 필요할 때 로봇에게 말할 수 있습니다."
+              : <>세션 <strong>{roomCode}</strong>의 영상·음성을 보고, 필요할 때 로봇에게 말할 수 있습니다.</>}
+          </p>
         </div>
         <StatusBadge state={state} />
       </section>
@@ -1015,11 +1183,17 @@ function Viewer({
       <section className="guardian-stage">
         <div className="video-panel guardian-video-panel">
           <div className="video-toolbar">
-            <span>펫 로봇 카메라</span>
+            <span>우리 집 홈캠</span>
             <span className="quality-label">AWS KVS · PRIVATE</span>
           </div>
           <div className="video-frame guardian-frame">
             <video ref={videoRef} autoPlay playsInline muted={speakerMuted} data-testid="guardian-video" />
+            <div className="homecam-viewer-state-row" aria-label="실시간 홈캠 상태">
+              <span className={state === "live" ? "is-active" : ""}><i />LIVE</span>
+              <span className={storageMode && state === "live" ? "is-active is-recording" : ""}><i />REC</span>
+              <span className={state !== "offline" && (device?.cameraEnabled ?? true) ? "is-active" : ""}><i />CAM</span>
+              <span className={(device?.microphoneEnabled ?? true) ? "is-active" : ""}><i />MIC</span>
+            </div>
             {state !== "live" && (
               <div className="video-placeholder">
                 <div className="signal-rings" aria-hidden="true"><span /></div>
@@ -1043,7 +1217,7 @@ function Viewer({
             <div className="viewer-control-row">
               <button
                 className={`button compact ${talking ? "talking" : "secondary"}`}
-                disabled={microphonePending || state !== "live" || storageMode !== true}
+                disabled={microphonePending || talkLeasePending || state !== "live"}
                 onClick={() => {
                   if (!microphoneAvailable) void prepareMicrophone();
                 }}
@@ -1051,12 +1225,12 @@ function Viewer({
                   if (!microphoneAvailable) return;
                   event.preventDefault();
                   event.currentTarget.setPointerCapture(event.pointerId);
-                  startTalking();
+                  void startTalking();
                 }}
-                onPointerUp={silenceMicrophone}
-                onPointerCancel={silenceMicrophone}
-                onPointerLeave={silenceMicrophone}
-                onBlur={silenceMicrophone}
+                onPointerUp={() => releaseTalkLease()}
+                onPointerCancel={() => releaseTalkLease()}
+                onPointerLeave={() => releaseTalkLease()}
+                onBlur={() => releaseTalkLease()}
                 onKeyDown={(event) => {
                   if (
                     microphoneAvailable &&
@@ -1064,19 +1238,21 @@ function Viewer({
                     (event.key === " " || event.key === "Enter")
                   ) {
                     event.preventDefault();
-                    startTalking();
+                    void startTalking();
                   }
                 }}
                 onKeyUp={(event) => {
                   if (event.key === " " || event.key === "Enter") {
                     event.preventDefault();
-                    silenceMicrophone();
+                    releaseTalkLease();
                   }
                 }}
                 aria-pressed={talking}
               >
                 {microphonePending
                   ? "마이크 권한 확인 중"
+                  : talkLeasePending
+                    ? "말하기 권한 확인 중"
                   : !microphoneAvailable
                     ? "마이크 연결"
                     : talking
@@ -1090,7 +1266,7 @@ function Viewer({
                 className="button secondary compact"
                 disabled={state === "connecting" || microphonePending}
                 onClick={() => {
-                  silenceMicrophone();
+                  releaseTalkLease();
                   setError("");
                   setState("connecting");
                   setSoundBlocked(false);
@@ -1108,14 +1284,14 @@ function Viewer({
           <div className="panel-card">
             <span className="card-label">세션 정보</span>
             <dl>
-              <div><dt>세션 코드</dt><dd>{roomCode}</dd></div>
-              <div><dt>접근 확인</dt><dd>코드 + 비밀번호</dd></div>
-              <div><dt>내 마이크</dt><dd>{storageMode === false ? "P2P 미지원" : !microphoneAvailable ? "미연결" : talking ? "전송 중" : "기본 음소거"}</dd></div>
+              <div><dt>{deviceId ? "홈캠" : "세션 코드"}</dt><dd>{device?.displayName ?? (deviceId ? "등록된 기기" : roomCode)}</dd></div>
+              <div><dt>접근 확인</dt><dd>{deviceId ? "소유자·가족 계정" : "코드 + 비밀번호"}</dd></div>
+              <div><dt>내 마이크</dt><dd>{!microphoneAvailable ? "미연결" : talking ? "전송 중" : "기본 음소거"}</dd></div>
               <div><dt>녹화</dt><dd>{storageMode === false ? "사용 안 함" : "7일 보관"}</dd></div>
               <div><dt>연결</dt><dd>AWS KVS WebRTC</dd></div>
             </dl>
           </div>
-          <button className="back-button" onClick={onExit}>역할 선택으로 돌아가기</button>
+          <button className="back-button" onClick={onExit}>{deviceId ? "홈캠 홈으로 돌아가기" : "역할 선택으로 돌아가기"}</button>
         </aside>
       </section>
     </main>
@@ -1188,9 +1364,9 @@ function Header() {
 export default function Home() {
   const [mode, setMode] = useState<Mode>("landing");
   const [roomCode, setRoomCode] = useState("");
-  const [joinCode, setJoinCode] = useState("");
   const [viewerPassword, setViewerPassword] = useState("");
-  const [joinPassword, setJoinPassword] = useState("");
+  const [viewerDeviceId, setViewerDeviceId] = useState("");
+  const [viewerDevice, setViewerDevice] = useState<HomecamDevice | null>(null);
   const [creatingSession, setCreatingSession] = useState(false);
   const [landingError, setLandingError] = useState("");
 
@@ -1199,8 +1375,11 @@ export default function Home() {
     const requestedMode = params.get("role");
     const requestedRoom = normalizeRoomCode(params.get("room") ?? "");
     if (requestedMode === "viewer" && requestedRoom.length === 6) {
+      window.history.replaceState({}, "", window.location.pathname);
       window.queueMicrotask(() => {
-        setJoinCode(requestedRoom);
+        setLandingError(
+          `기존 세션 ${requestedRoom}의 시청 비밀번호를 ‘개발·이전 버전 연결’에서 입력해 주세요.`,
+        );
       });
     }
   }, []);
@@ -1210,7 +1389,8 @@ export default function Home() {
     setMode("landing");
     setRoomCode("");
     setViewerPassword("");
-    setJoinPassword("");
+    setViewerDeviceId("");
+    setViewerDevice(null);
     setLandingError("");
   };
 
@@ -1218,7 +1398,15 @@ export default function Home() {
     return <Broadcaster roomCode={roomCode} viewerPassword={viewerPassword} onExit={reset} />;
   }
   if (mode === "viewer") {
-    return <Viewer roomCode={roomCode} viewerPassword={viewerPassword} onExit={reset} />;
+    return (
+      <Viewer
+        roomCode={roomCode}
+        viewerPassword={viewerPassword}
+        deviceId={viewerDeviceId || undefined}
+        device={viewerDevice ?? undefined}
+        onExit={reset}
+      />
+    );
   }
 
   const createBroadcast = async () => {
@@ -1237,118 +1425,42 @@ export default function Home() {
     }
   };
 
-  const joinBroadcast = () => {
-    const code = normalizeRoomCode(joinCode);
-    const password = normalizeViewerPassword(joinPassword);
+  const joinLegacyBroadcast = (legacyRoomCode: string, legacyPassword: string) => {
+    const code = normalizeRoomCode(legacyRoomCode);
+    const password = normalizeViewerPassword(legacyPassword);
     if (code.length !== 6 || !isCompleteViewerPassword(password)) return;
     setRoomCode(code);
     setViewerPassword(password);
+    setViewerDeviceId("");
+    setViewerDevice(null);
+    setMode("viewer");
+  };
+
+  const openRegisteredDevice = async (device: HomecamDevice) => {
+    setRoomCode(device.activeSession?.roomCode ?? "");
+    // 등록된 소유자·가족은 공유 비밀번호가 아니라 로그인된 계정 권한으로 입장합니다.
+    setViewerPassword("");
+    setViewerDeviceId(device.id);
+    setViewerDevice(device);
     setMode("viewer");
   };
 
   return (
-    <main className="landing-shell">
-      <Header />
-      <section className="hero">
-        <div className="hero-copy">
-          <span className="eyebrow">SOFTWARE MAESTRO · AIoT PET</span>
-          <h1>노트북 캠에서 시작해<br /><em>AWS로 실시간 연결</em>합니다.</h1>
-          <p>
-            Amazon Kinesis Video Streams WebRTC를 통해 다른 네트워크의 보호자 화면으로
-            저지연 영상과 양방향 음성을 전송하고, 클라우드 녹화는 7일간 안전하게 보관합니다.
+    <HomecamDashboard
+      onOpenLive={openRegisteredDevice}
+      onCreateLegacyBroadcast={createBroadcast}
+      onJoinLegacy={joinLegacyBroadcast}
+      creatingLegacyBroadcast={creatingSession}
+      externalError={landingError}
+      legacyArchive={
+        <>
+          <p className="sr-only">
+            이전 버전은 AWS로 실시간 연결하는 AWS 세션 만들기, 실시간 시청자,
+            양방향 음성, 클라우드 7일 보관, 코드+비밀번호 시청 기능을 제공합니다.
           </p>
-          <div className="hero-meta">
-            <span><strong>01</strong> 카메라 1대</span>
-            <span><strong>02</strong> 양방향 음성</span>
-            <span><strong>03</strong> 클라우드 7일 보관</span>
-          </div>
-        </div>
-        <div className="hero-orbit" aria-hidden="true">
-          <div className="orbit orbit-one" />
-          <div className="orbit orbit-two" />
-          <div className="robot-eye"><span /></div>
-          <span className="orbit-label top">AWS KVS</span>
-          <span className="orbit-label bottom">GUARDIAN</span>
-        </div>
-      </section>
-
-      <section className="role-section">
-        <div className="section-heading">
-          <span className="eyebrow">CHOOSE A ROLE</span>
-          <h2>어느 화면을 열까요?</h2>
-        </div>
-        {landingError && <p className="error-message" role="alert">{landingError}</p>}
-        <div className="role-grid">
-          <article className="role-card broadcaster-card">
-            <span className="role-number">01</span>
-            <div>
-              <span className="card-label">노트북 또는 로봇 쪽</span>
-              <h3>카메라 송출자</h3>
-              <p>공개 권한을 받은 ID만 세션을 만들고, 실시간 송출·양방향 음성·클라우드 녹화를 시작합니다.</p>
-            </div>
-            <button
-              className="button primary"
-              onClick={createBroadcast}
-              disabled={creatingSession}
-              data-testid="create-broadcast"
-            >
-              {creatingSession ? "세션 만드는 중" : "AWS 세션 만들기"}
-            </button>
-          </article>
-
-          <article className="role-card viewer-card">
-            <span className="role-number">02</span>
-            <div>
-              <span className="card-label">보호자 쪽</span>
-              <h3>실시간 시청자</h3>
-              <p>ID 로그인 후 전달받은 세션 코드와 시청 비밀번호를 모두 입력합니다.</p>
-            </div>
-            <div className="join-fields">
-              <div className="join-row">
-                <label>
-                  <span className="sr-only">세션 코드</span>
-                  <input
-                    value={joinCode}
-                    onChange={(event) => setJoinCode(normalizeRoomCode(event.target.value))}
-                    placeholder="6자리 코드"
-                    aria-label="세션 코드"
-                    autoComplete="one-time-code"
-                    maxLength={6}
-                  />
-                </label>
-                <label className="password-input">
-                  <span className="sr-only">시청 비밀번호</span>
-                  <input
-                    value={joinPassword}
-                    onChange={(event) =>
-                      setJoinPassword(normalizeViewerPassword(event.target.value))
-                    }
-                    onKeyDown={(event) => event.key === "Enter" && joinBroadcast()}
-                    placeholder="시청 비밀번호"
-                    aria-label="시청 비밀번호"
-                    autoComplete="off"
-                    maxLength={19}
-                  />
-                </label>
-              </div>
-              <button
-                className="button dark"
-                onClick={joinBroadcast}
-                disabled={joinCode.length !== 6 || !isCompleteViewerPassword(joinPassword)}
-              >
-                입장
-              </button>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <RecordingArchive />
-
-      <footer className="site-footer">
-        <span>PRIVATE ALPHA 01</span>
-        <p>AWS KVS WebRTC · 송출 ID 권한 · 코드+비밀번호 시청 · 양방향 음성 · 7일 클라우드 녹화</p>
-      </footer>
-    </main>
+          <RecordingArchive />
+        </>
+      }
+    />
   );
 }

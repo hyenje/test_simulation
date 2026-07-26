@@ -4,6 +4,7 @@ import {
   rewriteRecordingPlaylist,
 } from "../../../../../../recording-playback-proxy";
 import { getRequestUserEmail } from "../../../../../../server-auth";
+import { getAuthorizedRecordingSession } from "../../../../../../../db/petcam";
 
 export const dynamic = "force-dynamic";
 
@@ -30,6 +31,11 @@ export async function GET(
   if (!userEmail) return failure(401);
 
   const { recordingId, playbackId, resource } = await context.params;
+  const authorizedRecording = await getAuthorizedRecordingSession(
+    userEmail,
+    recordingId,
+  ).catch(() => null);
+  if (!authorizedRecording) return failure(403);
   const runtime = env as unknown as PlaybackProxyEnv;
   const playback = await resolveRecordingPlaybackProxy(
     {

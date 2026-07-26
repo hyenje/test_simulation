@@ -9,15 +9,17 @@ import {
 import { isValidViewerPassword } from "../../../../db/session-secret";
 import { requestBrokerJoinStorage, type KvsRole } from "../../../kvs-broker";
 import {
+  resolveDeviceKvsResources,
+  type DeviceKvsEnvironment,
+} from "../../../kvs-device-config";
+import {
   canBroadcastForConfiguredAccount,
   getRequestUserEmail,
 } from "../../../server-auth";
 
 export const dynamic = "force-dynamic";
 
-type JoinEnv = {
-  KVS_CHANNEL_ARN?: string;
-  KVS_STREAM_ARN?: string;
+type JoinEnv = DeviceKvsEnvironment & {
   PETCAM_SHARE_SECRET?: string;
 };
 
@@ -52,10 +54,7 @@ export async function POST(request: Request) {
   }
 
   const runtime = env as unknown as JoinEnv;
-  if (!runtime.KVS_STREAM_ARN) {
-    return noStore({ error: "AWS 저장 모드가 활성화되지 않았습니다." }, 409);
-  }
-  if (!runtime.KVS_CHANNEL_ARN || !runtime.PETCAM_SHARE_SECRET) {
+  if (!runtime.PETCAM_SHARE_SECRET) {
     return noStore({ error: "AWS 저장 연결 설정이 필요합니다." }, 503);
   }
 
@@ -86,7 +85,16 @@ export async function POST(request: Request) {
         : "세션 코드 또는 시청 비밀번호가 올바르지 않습니다.";
     return noStore({ error }, 403);
   }
-  if (session.channelArn !== runtime.KVS_CHANNEL_ARN) {
+  let resources;
+  try {
+    resources = resolveDeviceKvsResources(runtime, session.deviceId);
+  } catch {
+    return noStore({ error: "AWS 장치 매핑 설정이 올바르지 않습니다." }, 503);
+  }
+  if (!resources?.streamArn || !resources.storageChannelArn) {
+    return noStore({ error: "AWS 저장 모드가 활성화되지 않았습니다." }, 409);
+  }
+  if (session.channelArn !== resources.storageChannelArn) {
     return noStore({ error: "AWS 저장 채널 설정이 일치하지 않습니다." }, 503);
   }
 
@@ -99,7 +107,12 @@ export async function POST(request: Request) {
   if (!canJoin) return rateLimited();
 
   try {
-    const broker = await requestBrokerJoinStorage({ role, clientId });
+    const broker = await requestBrokerJoinStorage({
+      deviceId: session.deviceId,
+      role,
+      clientId,
+      channelMode: "storage",
+    });
     if (broker.channelArn !== session.channelArn) {
       return noStore({ error: "AWS 저장 채널 설정이 일치하지 않습니다." }, 503);
     }

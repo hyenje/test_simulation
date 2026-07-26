@@ -1,17 +1,18 @@
 import { env } from "cloudflare:workers";
 import { createLiveSession, endLiveSession } from "../../../db/petcam";
 import {
+  resolveDeviceKvsResources,
+  type DeviceKvsEnvironment,
+} from "../../kvs-device-config";
+import {
   canBroadcastForConfiguredAccount,
   getRequestUserEmail,
 } from "../../server-auth";
 
 export const dynamic = "force-dynamic";
 
-type SessionEnv = {
-  KVS_CHANNEL_ARN?: string;
-  KVS_STREAM_ARN?: string;
+type SessionEnv = DeviceKvsEnvironment & {
   PETCAM_BROADCASTER_EMAILS?: string;
-  PETCAM_DEVICE_ID?: string;
   PETCAM_SHARE_SECRET?: string;
 };
 
@@ -20,7 +21,20 @@ export async function POST(request: Request) {
   if (!ownerEmail) return noStore({ error: "로그인이 필요합니다." }, 401);
 
   const runtime = env as unknown as SessionEnv;
-  const channelArn = runtime.KVS_CHANNEL_ARN;
+  const deviceId = runtime.PETCAM_DEVICE_ID?.trim();
+  if (!deviceId) {
+    return noStore({ error: "레거시 홈캠 장치 ID 설정이 필요합니다." }, 503);
+  }
+  let resources;
+  try {
+    resources = resolveDeviceKvsResources(runtime, deviceId);
+  } catch {
+    return noStore({ error: "AWS 장치 매핑 설정이 올바르지 않습니다." }, 503);
+  }
+  const storageMode = Boolean(resources?.streamArn && resources.storageChannelArn);
+  const channelArn = storageMode
+    ? resources?.storageChannelArn
+    : resources?.p2pChannelArn;
   if (!channelArn) return noStore({ error: "AWS 채널 설정이 필요합니다." }, 503);
   if (!runtime.PETCAM_SHARE_SECRET) {
     return noStore({ error: "시청 비밀번호 보안 설정이 필요합니다." }, 503);
@@ -36,11 +50,11 @@ export async function POST(request: Request) {
   try {
     const session = await createLiveSession({
       ownerEmail,
-      deviceId: runtime.PETCAM_DEVICE_ID ?? "laptop-camera-01",
+      deviceId,
       displayName: "노트북 카메라 01",
       channelArn,
       shareSecret: runtime.PETCAM_SHARE_SECRET,
-      streamArn: runtime.KVS_STREAM_ARN,
+      streamArn: storageMode ? resources?.streamArn ?? undefined : undefined,
     });
     return noStore({ session }, 201);
   } catch (error) {
