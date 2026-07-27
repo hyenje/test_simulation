@@ -35,6 +35,7 @@ class D1Database {
   constructor(database) {
     this.database = database;
     this.failBatchAt = null;
+    this.beforeBatch = null;
   }
 
   prepare(sql) {
@@ -42,6 +43,11 @@ class D1Database {
   }
 
   async batch(statements) {
+    if (this.beforeBatch) {
+      const beforeBatch = this.beforeBatch;
+      this.beforeBatch = null;
+      beforeBatch();
+    }
     this.database.exec("BEGIN");
     try {
       const results = [];
@@ -260,5 +266,58 @@ test("a failed migration batch rolls back every legacy device change", async () 
       .prepare("SELECT COUNT(*) AS count FROM recording_sessions")
       .get().count,
     6,
+  );
+});
+
+test("an owner or credential race makes the guarded migration a no-op", async () => {
+  const harness = await createHarness();
+  seedLegacyDevice(harness.database);
+  harness.d1.beforeBatch = () => {
+    harness.database
+      .prepare(
+        `INSERT INTO device_credentials
+         (id, device_id, label, token_digest, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "b2cf0d3d-d84c-49e1-aaed-533328473dfb",
+        "laptop-camera-01",
+        "Concurrent credential",
+        "f4a6776a63f7c9d33b819c7452fd903a9c128a442d06b649324bfeec4130a575",
+        "2026-10-25T11:37:26.020Z",
+      );
+  };
+
+  await assert.rejects(
+    harness.provisionHomecamDevice(provisioningInput()),
+    /HOMECAM_PROVISIONING_CONFLICT/,
+  );
+  assert.equal(
+    harness.database
+      .prepare("SELECT kvs_channel_arn FROM devices WHERE id = ?")
+      .get("laptop-camera-01").kvs_channel_arn,
+    P2P_ARN,
+  );
+  assert.equal(
+    harness.database
+      .prepare("SELECT COUNT(*) AS count FROM devices WHERE id = ?")
+      .get("gazebo-homecam").count,
+    0,
+  );
+  assert.equal(
+    harness.database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM device_credentials WHERE device_id = ?",
+      )
+      .get("laptop-camera-01").count,
+    1,
+  );
+  assert.equal(
+    harness.database
+      .prepare(
+        "SELECT COUNT(*) AS count FROM stream_sessions WHERE device_id = ?",
+      )
+      .get("laptop-camera-01").count,
+    12,
   );
 });

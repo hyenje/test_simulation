@@ -174,78 +174,201 @@ async function migrateLegacyDevice(
     d1
       .prepare(
         `UPDATE devices SET kvs_channel_arn = ?
-         WHERE id = ? AND kvs_channel_arn = ?`,
+         WHERE id = ? AND kvs_channel_arn = ?
+           AND NOT EXISTS (SELECT 1 FROM devices WHERE id = ?)
+           AND (SELECT COUNT(*) FROM device_memberships
+                WHERE device_id = ?) = 1
+           AND EXISTS (
+             SELECT 1 FROM device_memberships
+             WHERE device_id = ? AND user_email = ? AND role = 'owner'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM device_credentials WHERE device_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM device_state WHERE device_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM homecam_events WHERE device_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM stream_sessions
+             WHERE device_id = ? AND status = 'active' AND expires_at > ?
+           )`,
       )
       .bind(
         input.migrationChannelArn,
         legacyDeviceId,
         input.kvsChannelArn,
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.ownerEmail,
+        legacyDeviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        nowIso,
       ),
     d1
       .prepare(
         `INSERT INTO devices (id, display_name, kvs_channel_arn, created_at)
-         VALUES (?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
       .bind(
         input.deviceId,
         input.displayName,
         input.kvsChannelArn,
         nowIso,
+        legacyDeviceId,
+        input.migrationChannelArn,
       ),
     d1
       .prepare(
-        "UPDATE device_memberships SET device_id = ? WHERE device_id = ?",
+        `UPDATE device_memberships SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, legacyDeviceId),
-    d1
-      .prepare("UPDATE stream_sessions SET device_id = ? WHERE device_id = ?")
-      .bind(input.deviceId, legacyDeviceId),
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
-        "UPDATE device_credentials SET device_id = ? WHERE device_id = ?",
+        `UPDATE stream_sessions SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, legacyDeviceId),
-    d1
-      .prepare("UPDATE device_state SET device_id = ? WHERE device_id = ?")
-      .bind(input.deviceId, legacyDeviceId),
-    d1
-      .prepare("UPDATE homecam_events SET device_id = ? WHERE device_id = ?")
-      .bind(input.deviceId, legacyDeviceId),
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
-        "UPDATE homecam_push_outbox SET device_id = ? WHERE device_id = ?",
+        `UPDATE device_credentials SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, legacyDeviceId),
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
-        "UPDATE push_subscriptions SET device_id = ? WHERE device_id = ?",
+        `UPDATE device_state SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, legacyDeviceId),
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
-        "UPDATE access_audit_log SET device_id = ? WHERE device_id = ?",
+        `UPDATE homecam_events SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, legacyDeviceId),
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
-      .prepare("UPDATE talk_leases SET device_id = ? WHERE device_id = ?")
-      .bind(input.deviceId, legacyDeviceId),
+      .prepare(
+        `UPDATE homecam_push_outbox SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
+      )
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
-      .prepare("DELETE FROM devices WHERE id = ? AND kvs_channel_arn = ?")
-      .bind(legacyDeviceId, input.migrationChannelArn),
+      .prepare(
+        `UPDATE push_subscriptions SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
+      )
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
+    d1
+      .prepare(
+        `UPDATE access_audit_log SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
+      )
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
+    d1
+      .prepare(
+        `UPDATE talk_leases SET device_id = ?
+         WHERE device_id = ? AND EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
+      )
+      .bind(
+        input.deviceId,
+        legacyDeviceId,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
         `INSERT INTO device_state
          (device_id, monitoring_enabled, camera_enabled, microphone_enabled,
           source_profile, active_stream_mode, media_healthy,
           detector_healthy, updated_at)
-         VALUES (?, 0, 1, 1, ?, 'idle', 0, 0, ?)`,
+         SELECT ?, 0, 1, 1, ?, 'idle', 0, 0, ?
+         WHERE EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
-      .bind(input.deviceId, input.sourceProfile, nowIso),
+      .bind(
+        input.deviceId,
+        input.sourceProfile,
+        nowIso,
+        legacyDeviceId,
+        input.migrationChannelArn,
+      ),
     d1
       .prepare(
         `INSERT INTO device_credentials
          (id, device_id, label, token_digest, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
       .bind(
         input.credential.id,
@@ -254,13 +377,18 @@ async function migrateLegacyDevice(
         input.credential.tokenDigest,
         nowIso,
         input.credential.expiresAt,
+        legacyDeviceId,
+        input.migrationChannelArn,
       ),
     d1
       .prepare(
         `INSERT INTO access_audit_log
          (id, device_id, actor_type, actor_id, action, metadata_json, created_at)
-         VALUES (?, ?, 'system', 'internal-provisioner',
-                 'device.migrate', ?, ?)`,
+         SELECT ?, ?, 'system', 'internal-provisioner',
+                'device.migrate', ?, ?
+         WHERE EXISTS (
+           SELECT 1 FROM devices WHERE id = ? AND kvs_channel_arn = ?
+         )`,
       )
       .bind(
         crypto.randomUUID(),
@@ -273,7 +401,12 @@ async function migrateLegacyDevice(
             before.channelOwnerSummary?.recording_count ?? 0,
         }),
         nowIso,
+        legacyDeviceId,
+        input.migrationChannelArn,
       ),
+    d1
+      .prepare("DELETE FROM devices WHERE id = ? AND kvs_channel_arn = ?")
+      .bind(legacyDeviceId, input.migrationChannelArn),
   ];
   try {
     await d1.batch(statements);
