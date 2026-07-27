@@ -14,6 +14,10 @@ type ProvisioningSnapshot = {
   } | null;
   deviceByChannel: { id: string } | null;
   membership: { role: string } | null;
+  membershipSummary: {
+    total: number;
+    exact_count: number;
+  };
   state: { device_id: string } | null;
   credentialById: {
     id: string;
@@ -24,6 +28,10 @@ type ProvisioningSnapshot = {
     revoked_at: string | null;
   } | null;
   credentialByDigest: { id: string } | null;
+  credentialSummary: {
+    total: number;
+    exact_count: number;
+  };
 };
 
 export class HomecamProvisioningConflict extends Error {
@@ -37,108 +45,92 @@ export async function provisionHomecamDevice(
 ) {
   await ensureHomecamSchema();
   const before = await provisioningSnapshot(input);
-  assertCompatible(before, input);
+  if (isCompleteAndCompatible(before, input)) {
+    return { deviceId: input.deviceId, created: false };
+  }
+  if (!isEmpty(before)) {
+    throw new HomecamProvisioningConflict();
+  }
 
   const d1 = getD1();
   const nowIso = new Date().toISOString();
-  const statements = [];
-  if (!before.deviceById) {
-    statements.push(
-      d1
-        .prepare(
-          `INSERT INTO devices (id, display_name, kvs_channel_arn, created_at)
-           VALUES (?, ?, ?, ?)`,
-        )
-        .bind(
-          input.deviceId,
-          input.displayName,
-          input.kvsChannelArn,
-          nowIso,
-        ),
-    );
-  }
-  if (!before.membership) {
-    statements.push(
-      d1
-        .prepare(
-          `INSERT INTO device_memberships
-           (device_id, user_email, role, created_at)
-           VALUES (?, ?, 'owner', ?)`,
-        )
-        .bind(input.deviceId, input.ownerEmail, nowIso),
-    );
-  }
-  if (!before.state) {
-    statements.push(
-      d1
-        .prepare(
-          `INSERT INTO device_state
-           (device_id, monitoring_enabled, camera_enabled, microphone_enabled,
-            source_profile, active_stream_mode, media_healthy,
-            detector_healthy, updated_at)
-           VALUES (?, 0, 1, 1, ?, 'idle', 0, 0, ?)`,
-        )
-        .bind(input.deviceId, input.sourceProfile, nowIso),
-    );
-  }
-  if (!before.credentialById) {
-    statements.push(
-      d1
-        .prepare(
-          `INSERT INTO device_credentials
-           (id, device_id, label, token_digest, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(
-          input.credential.id,
-          input.deviceId,
-          input.credential.label,
-          input.credential.tokenDigest,
-          nowIso,
-          input.credential.expiresAt,
-        ),
-    );
-  }
-
-  const created = statements.length > 0;
-  if (created) {
-    statements.push(
-      d1
-        .prepare(
-          `INSERT INTO access_audit_log
-           (id, device_id, actor_type, actor_id, action, metadata_json, created_at)
-           VALUES (?, ?, 'system', 'internal-provisioner',
-                   'device.provision', ?, ?)`,
-        )
-        .bind(
-          crypto.randomUUID(),
-          input.deviceId,
-          JSON.stringify({
-            credentialId: input.credential.id,
-            sourceProfile: input.sourceProfile,
-          }),
-          nowIso,
-        ),
-    );
-    try {
-      await d1.batch(statements);
-    } catch (error) {
-      const afterRace = await provisioningSnapshot(input);
-      if (!isCompleteAndCompatible(afterRace, input)) {
-        if (!isCompatible(afterRace, input)) {
-          throw new HomecamProvisioningConflict();
-        }
-        throw error;
-      }
+  const statements = [
+    d1
+      .prepare(
+        `INSERT INTO devices (id, display_name, kvs_channel_arn, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .bind(
+        input.deviceId,
+        input.displayName,
+        input.kvsChannelArn,
+        nowIso,
+      ),
+    d1
+      .prepare(
+        `INSERT INTO device_memberships
+         (device_id, user_email, role, created_at)
+         VALUES (?, ?, 'owner', ?)`,
+      )
+      .bind(input.deviceId, input.ownerEmail, nowIso),
+    d1
+      .prepare(
+        `INSERT INTO device_state
+         (device_id, monitoring_enabled, camera_enabled, microphone_enabled,
+          source_profile, active_stream_mode, media_healthy,
+          detector_healthy, updated_at)
+         VALUES (?, 0, 1, 1, ?, 'idle', 0, 0, ?)`,
+      )
+      .bind(input.deviceId, input.sourceProfile, nowIso),
+    d1
+      .prepare(
+        `INSERT INTO device_credentials
+         (id, device_id, label, token_digest, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        input.credential.id,
+        input.deviceId,
+        input.credential.label,
+        input.credential.tokenDigest,
+        nowIso,
+        input.credential.expiresAt,
+      ),
+    d1
+      .prepare(
+        `INSERT INTO access_audit_log
+         (id, device_id, actor_type, actor_id, action, metadata_json, created_at)
+         VALUES (?, ?, 'system', 'internal-provisioner',
+                 'device.provision', ?, ?)`,
+      )
+      .bind(
+        crypto.randomUUID(),
+        input.deviceId,
+        JSON.stringify({
+          credentialId: input.credential.id,
+          sourceProfile: input.sourceProfile,
+        }),
+        nowIso,
+      ),
+  ];
+  try {
+    await d1.batch(statements);
+  } catch (error) {
+    const afterRace = await provisioningSnapshot(input);
+    if (isCompleteAndCompatible(afterRace, input)) {
       return { deviceId: input.deviceId, created: false };
     }
+    if (!isEmpty(afterRace)) {
+      throw new HomecamProvisioningConflict();
+    }
+    throw error;
   }
 
   const after = await provisioningSnapshot(input);
   if (!isCompleteAndCompatible(after, input)) {
     throw new HomecamProvisioningConflict();
   }
-  return { deviceId: input.deviceId, created };
+  return { deviceId: input.deviceId, created: true };
 }
 
 async function provisioningSnapshot(
@@ -149,9 +141,11 @@ async function provisioningSnapshot(
     deviceById,
     deviceByChannel,
     membership,
+    membershipSummary,
     state,
     credentialById,
     credentialByDigest,
+    credentialSummary,
   ] = await Promise.all([
     d1
       .prepare(
@@ -171,6 +165,17 @@ async function provisioningSnapshot(
       .bind(input.deviceId, input.ownerEmail)
       .first<ProvisioningSnapshot["membership"]>(),
     d1
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE
+             WHEN user_email = ? AND role = 'owner' THEN 1 ELSE 0
+           END), 0) AS exact_count
+         FROM device_memberships WHERE device_id = ?`,
+      )
+      .bind(input.ownerEmail, input.deviceId)
+      .first<ProvisioningSnapshot["membershipSummary"]>(),
+    d1
       .prepare("SELECT device_id FROM device_state WHERE device_id = ?")
       .bind(input.deviceId)
       .first<ProvisioningSnapshot["state"]>(),
@@ -185,24 +190,49 @@ async function provisioningSnapshot(
       .prepare("SELECT id FROM device_credentials WHERE token_digest = ?")
       .bind(input.credential.tokenDigest)
       .first<ProvisioningSnapshot["credentialByDigest"]>(),
+    d1
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE
+             WHEN id = ? AND label = ? AND token_digest = ?
+              AND expires_at = ? AND revoked_at IS NULL
+             THEN 1 ELSE 0
+           END), 0) AS exact_count
+         FROM device_credentials WHERE device_id = ?`,
+      )
+      .bind(
+        input.credential.id,
+        input.credential.label,
+        input.credential.tokenDigest,
+        input.credential.expiresAt,
+        input.deviceId,
+      )
+      .first<ProvisioningSnapshot["credentialSummary"]>(),
   ]);
   return {
     deviceById,
     deviceByChannel,
     membership,
+    membershipSummary: membershipSummary ?? { total: 0, exact_count: 0 },
     state,
     credentialById,
     credentialByDigest,
+    credentialSummary: credentialSummary ?? { total: 0, exact_count: 0 },
   };
 }
 
-function assertCompatible(
-  snapshot: ProvisioningSnapshot,
-  input: HomecamProvisioningInput,
-) {
-  if (!isCompatible(snapshot, input)) {
-    throw new HomecamProvisioningConflict();
-  }
+function isEmpty(snapshot: ProvisioningSnapshot) {
+  return (
+    !snapshot.deviceById &&
+    !snapshot.deviceByChannel &&
+    !snapshot.membership &&
+    snapshot.membershipSummary.total === 0 &&
+    !snapshot.state &&
+    !snapshot.credentialById &&
+    !snapshot.credentialByDigest &&
+    snapshot.credentialSummary.total === 0
+  );
 }
 
 function isCompleteAndCompatible(
@@ -212,10 +242,17 @@ function isCompleteAndCompatible(
   return (
     Boolean(
       snapshot.deviceById &&
+        snapshot.deviceByChannel &&
         snapshot.membership &&
         snapshot.state &&
-        snapshot.credentialById,
-    ) && isCompatible(snapshot, input)
+        snapshot.credentialById &&
+        snapshot.credentialByDigest,
+    ) &&
+    snapshot.membershipSummary.total === 1 &&
+    snapshot.membershipSummary.exact_count === 1 &&
+    snapshot.credentialSummary.total === 1 &&
+    snapshot.credentialSummary.exact_count === 1 &&
+    isCompatible(snapshot, input)
   );
 }
 
@@ -223,31 +260,16 @@ function isCompatible(
   snapshot: ProvisioningSnapshot,
   input: HomecamProvisioningInput,
 ) {
-  const deviceMatches =
-    !snapshot.deviceById ||
-    (snapshot.deviceById.display_name === input.displayName &&
-      snapshot.deviceById.kvs_channel_arn === input.kvsChannelArn);
-  const channelMatches =
-    !snapshot.deviceByChannel ||
-    snapshot.deviceByChannel.id === input.deviceId;
-  const membershipMatches =
-    !snapshot.membership || snapshot.membership.role === "owner";
-  const credentialMatches =
-    !snapshot.credentialById ||
-    (snapshot.credentialById.device_id === input.deviceId &&
-      snapshot.credentialById.label === input.credential.label &&
-      snapshot.credentialById.token_digest ===
-        input.credential.tokenDigest &&
-      snapshot.credentialById.expires_at === input.credential.expiresAt &&
-      snapshot.credentialById.revoked_at === null);
-  const digestMatches =
-    !snapshot.credentialByDigest ||
-    snapshot.credentialByDigest.id === input.credential.id;
   return (
-    deviceMatches &&
-    channelMatches &&
-    membershipMatches &&
-    credentialMatches &&
-    digestMatches
+    snapshot.deviceById?.display_name === input.displayName &&
+    snapshot.deviceById.kvs_channel_arn === input.kvsChannelArn &&
+    snapshot.deviceByChannel?.id === input.deviceId &&
+    snapshot.membership?.role === "owner" &&
+    snapshot.credentialById?.device_id === input.deviceId &&
+    snapshot.credentialById.label === input.credential.label &&
+    snapshot.credentialById.token_digest === input.credential.tokenDigest &&
+    snapshot.credentialById.expires_at === input.credential.expiresAt &&
+    snapshot.credentialById.revoked_at === null &&
+    snapshot.credentialByDigest?.id === input.credential.id
   );
 }

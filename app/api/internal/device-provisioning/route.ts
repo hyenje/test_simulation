@@ -3,7 +3,10 @@ import {
   HomecamProvisioningConflict,
   provisionHomecamDevice,
 } from "../../../../db/homecam-provisioning";
-import { parseHomecamProvisioningInput } from "../../../../db/homecam-provisioning-input";
+import {
+  homecamProvisioningManifestSha256,
+  parseHomecamProvisioningInput,
+} from "../../../../db/homecam-provisioning-input";
 import { noStore } from "../../../api-response";
 import {
   resolveDeviceKvsResources,
@@ -14,12 +17,25 @@ export const dynamic = "force-dynamic";
 
 type ProvisioningEnv = {
   DEVICE_PROVISIONING_SECRET?: string;
+  DEVICE_PROVISIONING_MANIFEST_SHA256?: string;
+  DEVICE_PROVISIONING_EXPIRES_AT?: string;
 } & DeviceKvsEnvironment;
 
 export async function POST(request: Request) {
   const runtime = env as unknown as ProvisioningEnv;
   const secret = runtime.DEVICE_PROVISIONING_SECRET;
-  if (!secret || secret.length < 43) {
+  const expectedManifest = runtime.DEVICE_PROVISIONING_MANIFEST_SHA256;
+  const expiresAt = runtime.DEVICE_PROVISIONING_EXPIRES_AT;
+  if (
+    !secret ||
+    secret.length < 43 ||
+    !expectedManifest ||
+    !/^[0-9a-f]{64}$/.test(expectedManifest) ||
+    !expiresAt ||
+    !Number.isFinite(Date.parse(expiresAt)) ||
+    new Date(Date.parse(expiresAt)).toISOString() !== expiresAt ||
+    Date.parse(expiresAt) <= Date.now()
+  ) {
     return noStore({ error: "찾을 수 없습니다." }, 404);
   }
   if (!(await authorized(request, secret))) {
@@ -30,7 +46,7 @@ export async function POST(request: Request) {
     return noStore({ error: "provisioning 요청이 너무 큽니다." }, 413);
   }
   const body = await request.text();
-  if (body.length > 8_192) {
+  if (new TextEncoder().encode(body).byteLength > 8_192) {
     return noStore({ error: "provisioning 요청이 너무 큽니다." }, 413);
   }
   const payload = (() => {
@@ -43,6 +59,10 @@ export async function POST(request: Request) {
   const parsed = parseHomecamProvisioningInput(payload);
   if (!parsed) {
     return noStore({ error: "provisioning 요청 형식을 확인해 주세요." }, 400);
+  }
+  const receivedManifest = await homecamProvisioningManifestSha256(parsed);
+  if (!(await constantTimeEqual(receivedManifest, expectedManifest))) {
+    return noStore({ error: "허용되지 않은 provisioning 요청입니다." }, 403);
   }
 
   try {
@@ -84,10 +104,11 @@ async function authorized(request: Request, expected: string) {
   if (!header?.startsWith("Bearer ")) return false;
   const received = header.slice("Bearer ".length);
   if (!received || received.length > 512) return false;
-  const [left, right] = await Promise.all([
-    sha256(received),
-    sha256(expected),
-  ]);
+  return constantTimeEqual(received, expected);
+}
+
+async function constantTimeEqual(received: string, expected: string) {
+  const [left, right] = await Promise.all([sha256(received), sha256(expected)]);
   let difference = 0;
   for (let index = 0; index < left.length; index += 1) {
     difference |= left[index] ^ right[index];

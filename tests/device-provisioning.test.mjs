@@ -25,6 +25,9 @@ async function loadParser() {
     Boolean,
     Number,
     String,
+    TextEncoder,
+    Uint8Array,
+    crypto: globalThis.crypto,
   });
   return commonJsModule.exports;
 }
@@ -46,7 +49,10 @@ function validPayload() {
 }
 
 test("one-time provisioning accepts only a bounded canonical payload", async () => {
-  const { parseHomecamProvisioningInput } = await loadParser();
+  const {
+    homecamProvisioningManifestSha256,
+    parseHomecamProvisioningInput,
+  } = await loadParser();
   const now = new Date("2026-07-27T00:00:00.000Z");
   assert.ok(parseHomecamProvisioningInput(validPayload(), now));
   assert.equal(
@@ -55,6 +61,17 @@ test("one-time provisioning accepts only a bounded canonical payload", async () 
       now,
     ),
     null,
+  );
+  assert.equal(
+    parseHomecamProvisioningInput(
+      { ...validPayload(), sourceProfile: ["sim"] },
+      now,
+    ),
+    null,
+  );
+  assert.match(
+    await homecamProvisioningManifestSha256(validPayload()),
+    /^[0-9a-f]{64}$/,
   );
   assert.equal(
     parseHomecamProvisioningInput(
@@ -104,10 +121,14 @@ test("provisioning route never accepts or returns the plaintext device token", a
     ),
   ]);
   assert.match(route, /DEVICE_PROVISIONING_SECRET/);
+  assert.match(route, /DEVICE_PROVISIONING_MANIFEST_SHA256/);
+  assert.match(route, /DEVICE_PROVISIONING_EXPIRES_AT/);
   assert.match(route, /crypto\.subtle\.digest/);
   assert.match(route, /resources\.source !== "mapping"/);
   assert.doesNotMatch(route, /\btoken:\s/);
   assert.match(database, /token_digest/);
   assert.match(database, /HomecamProvisioningConflict/);
   assert.match(database, /await d1\.batch\(statements\)/);
+  assert.match(database, /membershipSummary\.total === 1/);
+  assert.match(database, /credentialSummary\.total === 1/);
 });

@@ -46,6 +46,7 @@ export function parseHomecamProvisioningInput(
     /[\u0000-\u001f\u007f]/.test(value.displayName) ||
     typeof value.ownerEmail !== "string" ||
     normalizeEmail(value.ownerEmail) !== value.ownerEmail ||
+    typeof value.sourceProfile !== "string" ||
     !["sim", "aurora", "unknown"].includes(String(value.sourceProfile)) ||
     !isRecord(value.credential)
   ) {
@@ -102,6 +103,32 @@ export function parseHomecamProvisioningInput(
       expiresAt: credential.expiresAt,
     },
   };
+}
+
+export async function homecamProvisioningManifestSha256(
+  input: HomecamProvisioningRequest,
+) {
+  const canonical = JSON.stringify({
+    deviceId: input.deviceId,
+    displayName: input.displayName,
+    ownerEmail: input.ownerEmail,
+    sourceProfile: input.sourceProfile,
+    credential: {
+      id: input.credential.id,
+      label: input.credential.label,
+      tokenDigest: input.credential.tokenDigest,
+      expiresAt: input.credential.expiresAt,
+    },
+  });
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(canonical),
+    ),
+  );
+  return Array.from(digest, (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("");
 }
 
 function normalizeEmail(value: string) {
