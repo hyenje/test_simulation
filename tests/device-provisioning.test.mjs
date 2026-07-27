@@ -132,4 +132,6 @@ test("provisioning route never accepts or returns the plaintext device token", a
   assert.match(database, /membershipSummary\.total === 1/);
   assert.match(database, /credentialSummary\.total === 1/);
   assert.match(database, /channelOwnerDeviceId/);
+  assert.match(database, /requested_owner_count/);
+  assert.match(database, /active_session_count/);
 });

@@ -32,6 +32,17 @@ type ProvisioningSnapshot = {
     total: number;
     exact_count: number;
   };
+  channelOwnerSummary: {
+    display_name: string;
+    membership_count: number;
+    requested_owner_count: number;
+    credential_count: number;
+    session_count: number;
+    active_session_count: number;
+    recording_count: number;
+    event_count: number;
+    last_seen_at: string | null;
+  } | null;
 };
 
 export class HomecamProvisioningConflict extends Error {
@@ -216,6 +227,39 @@ async function provisioningSnapshot(
       )
       .first<ProvisioningSnapshot["credentialSummary"]>(),
   ]);
+  const channelOwnerSummary =
+    deviceByChannel && deviceByChannel.id !== input.deviceId
+      ? await d1
+          .prepare(
+            `SELECT
+               devices.display_name,
+               (SELECT COUNT(*) FROM device_memberships
+                WHERE device_id = devices.id) AS membership_count,
+               (SELECT COUNT(*) FROM device_memberships
+                WHERE device_id = devices.id
+                  AND user_email = ? AND role = 'owner')
+                 AS requested_owner_count,
+               (SELECT COUNT(*) FROM device_credentials
+                WHERE device_id = devices.id) AS credential_count,
+               (SELECT COUNT(*) FROM stream_sessions
+                WHERE device_id = devices.id) AS session_count,
+               (SELECT COUNT(*) FROM stream_sessions
+                WHERE device_id = devices.id AND status = 'active'
+                  AND expires_at > ?) AS active_session_count,
+               (SELECT COUNT(*) FROM recording_sessions
+                INNER JOIN stream_sessions
+                  ON stream_sessions.id = recording_sessions.session_id
+                WHERE stream_sessions.device_id = devices.id)
+                 AS recording_count,
+               (SELECT COUNT(*) FROM homecam_events
+                WHERE device_id = devices.id) AS event_count,
+               (SELECT last_seen_at FROM device_state
+                WHERE device_id = devices.id) AS last_seen_at
+             FROM devices WHERE devices.id = ?`,
+          )
+          .bind(input.ownerEmail, new Date().toISOString(), deviceByChannel.id)
+          .first<ProvisioningSnapshot["channelOwnerSummary"]>()
+      : null;
   return {
     deviceById,
     deviceByChannel,
@@ -225,6 +269,7 @@ async function provisioningSnapshot(
     credentialById,
     credentialByDigest,
     credentialSummary: credentialSummary ?? { total: 0, exact_count: 0 },
+    channelOwnerSummary,
   };
 }
 
@@ -311,5 +356,20 @@ function provisioningConflictDetails(
     credentialDigestMatches:
       !snapshot.credentialByDigest ||
       snapshot.credentialByDigest.id === input.credential.id,
+    channelOwnerSummary: snapshot.channelOwnerSummary
+      ? {
+          displayName: snapshot.channelOwnerSummary.display_name,
+          membershipCount: snapshot.channelOwnerSummary.membership_count,
+          requestedOwnerCount:
+            snapshot.channelOwnerSummary.requested_owner_count,
+          credentialCount: snapshot.channelOwnerSummary.credential_count,
+          sessionCount: snapshot.channelOwnerSummary.session_count,
+          activeSessionCount:
+            snapshot.channelOwnerSummary.active_session_count,
+          recordingCount: snapshot.channelOwnerSummary.recording_count,
+          eventCount: snapshot.channelOwnerSummary.event_count,
+          lastSeenAt: snapshot.channelOwnerSummary.last_seen_at,
+        }
+      : undefined,
   };
 }
