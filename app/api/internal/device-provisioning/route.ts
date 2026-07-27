@@ -19,6 +19,7 @@ type ProvisioningEnv = {
   DEVICE_PROVISIONING_SECRET?: string;
   DEVICE_PROVISIONING_MANIFEST_SHA256?: string;
   DEVICE_PROVISIONING_EXPIRES_AT?: string;
+  DEVICE_PROVISIONING_LEGACY_DEVICE_ID?: string;
 } & DeviceKvsEnvironment;
 
 export async function POST(request: Request) {
@@ -70,7 +71,8 @@ export async function POST(request: Request) {
     if (
       !resources ||
       resources.source !== "mapping" ||
-      !resources.p2pChannelArn
+      !resources.p2pChannelArn ||
+      !resources.storageChannelArn
     ) {
       return noStore(
         { error: "장치의 AWS 리소스 매핑을 찾지 못했습니다." },
@@ -80,11 +82,20 @@ export async function POST(request: Request) {
     const result = await provisionHomecamDevice({
       ...parsed,
       kvsChannelArn: resources.p2pChannelArn,
+      migrationChannelArn: resources.storageChannelArn,
+      legacyDeviceId:
+        runtime.DEVICE_PROVISIONING_LEGACY_DEVICE_ID?.trim() || null,
     });
     return noStore(
       {
         deviceId: result.deviceId,
-        status: result.created ? "created" : "unchanged",
+        status: result.migrated
+          ? result.created
+            ? "migrated"
+            : "unchanged"
+          : result.created
+            ? "created"
+            : "unchanged",
       },
       result.created ? 201 : 200,
     );

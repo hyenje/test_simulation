@@ -4,6 +4,8 @@ import type { HomecamProvisioningRequest } from "./homecam-provisioning-input";
 
 type HomecamProvisioningInput = HomecamProvisioningRequest & {
   kvsChannelArn: string;
+  migrationChannelArn: string;
+  legacyDeviceId: string | null;
 };
 
 type ProvisioningSnapshot = {
@@ -13,6 +15,7 @@ type ProvisioningSnapshot = {
     kvs_channel_arn: string;
   } | null;
   deviceByChannel: { id: string } | null;
+  deviceByMigrationChannel: { id: string } | null;
   membership: { role: string } | null;
   membershipSummary: {
     total: number;
@@ -41,6 +44,7 @@ type ProvisioningSnapshot = {
     active_session_count: number;
     recording_count: number;
     event_count: number;
+    state_count: number;
     last_seen_at: string | null;
   } | null;
 };
@@ -63,12 +67,18 @@ export async function provisionHomecamDevice(
   await ensureHomecamSchema();
   const before = await provisioningSnapshot(input);
   if (isCompleteAndCompatible(before, input)) {
-    return { deviceId: input.deviceId, created: false };
+    return { deviceId: input.deviceId, created: false, migrated: false };
   }
-  if (!isEmpty(before)) {
-    throw new HomecamProvisioningConflict(before, input);
+  if (isEmpty(before)) {
+    return createProvisionedDevice(input);
   }
+  if (canMigrateLegacyDevice(before, input)) {
+    return migrateLegacyDevice(before, input);
+  }
+  throw new HomecamProvisioningConflict(before, input);
+}
 
+async function createProvisionedDevice(input: HomecamProvisioningInput) {
   const d1 = getD1();
   const nowIso = new Date().toISOString();
   const statements = [
@@ -135,7 +145,7 @@ export async function provisionHomecamDevice(
   } catch (error) {
     const afterRace = await provisioningSnapshot(input);
     if (isCompleteAndCompatible(afterRace, input)) {
-      return { deviceId: input.deviceId, created: false };
+      return { deviceId: input.deviceId, created: false, migrated: false };
     }
     if (!isEmpty(afterRace)) {
       throw new HomecamProvisioningConflict(afterRace, input);
@@ -147,7 +157,144 @@ export async function provisionHomecamDevice(
   if (!isCompleteAndCompatible(after, input)) {
     throw new HomecamProvisioningConflict(after, input);
   }
-  return { deviceId: input.deviceId, created: true };
+  return { deviceId: input.deviceId, created: true, migrated: false };
+}
+
+async function migrateLegacyDevice(
+  before: ProvisioningSnapshot,
+  input: HomecamProvisioningInput,
+) {
+  const legacyDeviceId = before.deviceByChannel?.id;
+  if (!legacyDeviceId) {
+    throw new HomecamProvisioningConflict(before, input);
+  }
+  const d1 = getD1();
+  const nowIso = new Date().toISOString();
+  const statements = [
+    d1
+      .prepare(
+        `UPDATE devices SET kvs_channel_arn = ?
+         WHERE id = ? AND kvs_channel_arn = ?`,
+      )
+      .bind(
+        input.migrationChannelArn,
+        legacyDeviceId,
+        input.kvsChannelArn,
+      ),
+    d1
+      .prepare(
+        `INSERT INTO devices (id, display_name, kvs_channel_arn, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .bind(
+        input.deviceId,
+        input.displayName,
+        input.kvsChannelArn,
+        nowIso,
+      ),
+    d1
+      .prepare(
+        "UPDATE device_memberships SET device_id = ? WHERE device_id = ?",
+      )
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare("UPDATE stream_sessions SET device_id = ? WHERE device_id = ?")
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare(
+        "UPDATE device_credentials SET device_id = ? WHERE device_id = ?",
+      )
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare("UPDATE device_state SET device_id = ? WHERE device_id = ?")
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare("UPDATE homecam_events SET device_id = ? WHERE device_id = ?")
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare(
+        "UPDATE homecam_push_outbox SET device_id = ? WHERE device_id = ?",
+      )
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare(
+        "UPDATE push_subscriptions SET device_id = ? WHERE device_id = ?",
+      )
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare(
+        "UPDATE access_audit_log SET device_id = ? WHERE device_id = ?",
+      )
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare("UPDATE talk_leases SET device_id = ? WHERE device_id = ?")
+      .bind(input.deviceId, legacyDeviceId),
+    d1
+      .prepare("DELETE FROM devices WHERE id = ? AND kvs_channel_arn = ?")
+      .bind(legacyDeviceId, input.migrationChannelArn),
+    d1
+      .prepare(
+        `INSERT INTO device_state
+         (device_id, monitoring_enabled, camera_enabled, microphone_enabled,
+          source_profile, active_stream_mode, media_healthy,
+          detector_healthy, updated_at)
+         VALUES (?, 0, 1, 1, ?, 'idle', 0, 0, ?)`,
+      )
+      .bind(input.deviceId, input.sourceProfile, nowIso),
+    d1
+      .prepare(
+        `INSERT INTO device_credentials
+         (id, device_id, label, token_digest, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        input.credential.id,
+        input.deviceId,
+        input.credential.label,
+        input.credential.tokenDigest,
+        nowIso,
+        input.credential.expiresAt,
+      ),
+    d1
+      .prepare(
+        `INSERT INTO access_audit_log
+         (id, device_id, actor_type, actor_id, action, metadata_json, created_at)
+         VALUES (?, ?, 'system', 'internal-provisioner',
+                 'device.migrate', ?, ?)`,
+      )
+      .bind(
+        crypto.randomUUID(),
+        input.deviceId,
+        JSON.stringify({
+          fromDeviceId: legacyDeviceId,
+          credentialId: input.credential.id,
+          preservedSessions: before.channelOwnerSummary?.session_count ?? 0,
+          preservedRecordings:
+            before.channelOwnerSummary?.recording_count ?? 0,
+        }),
+        nowIso,
+      ),
+  ];
+  try {
+    await d1.batch(statements);
+  } catch (error) {
+    const afterRace = await provisioningSnapshot(input);
+    if (isCompleteAndCompatible(afterRace, input)) {
+      return { deviceId: input.deviceId, created: false, migrated: true };
+    }
+    if (canMigrateLegacyDevice(afterRace, input)) {
+      throw error;
+    }
+    if (!isEmpty(afterRace)) {
+      throw new HomecamProvisioningConflict(afterRace, input);
+    }
+    throw error;
+  }
+  const after = await provisioningSnapshot(input);
+  if (!isCompleteAndCompatible(after, input)) {
+    throw new HomecamProvisioningConflict(after, input);
+  }
+  return { deviceId: input.deviceId, created: true, migrated: true };
 }
 
 async function provisioningSnapshot(
@@ -157,6 +304,7 @@ async function provisioningSnapshot(
   const [
     deviceById,
     deviceByChannel,
+    deviceByMigrationChannel,
     membership,
     membershipSummary,
     state,
@@ -174,6 +322,10 @@ async function provisioningSnapshot(
       .prepare("SELECT id FROM devices WHERE kvs_channel_arn = ?")
       .bind(input.kvsChannelArn)
       .first<ProvisioningSnapshot["deviceByChannel"]>(),
+    d1
+      .prepare("SELECT id FROM devices WHERE kvs_channel_arn = ?")
+      .bind(input.migrationChannelArn)
+      .first<ProvisioningSnapshot["deviceByMigrationChannel"]>(),
     d1
       .prepare(
         `SELECT role FROM device_memberships
@@ -253,6 +405,8 @@ async function provisioningSnapshot(
                  AS recording_count,
                (SELECT COUNT(*) FROM homecam_events
                 WHERE device_id = devices.id) AS event_count,
+               (SELECT COUNT(*) FROM device_state
+                WHERE device_id = devices.id) AS state_count,
                (SELECT last_seen_at FROM device_state
                 WHERE device_id = devices.id) AS last_seen_at
              FROM devices WHERE devices.id = ?`,
@@ -263,6 +417,7 @@ async function provisioningSnapshot(
   return {
     deviceById,
     deviceByChannel,
+    deviceByMigrationChannel,
     membership,
     membershipSummary: membershipSummary ?? { total: 0, exact_count: 0 },
     state,
@@ -277,6 +432,32 @@ function isEmpty(snapshot: ProvisioningSnapshot) {
   return (
     !snapshot.deviceById &&
     !snapshot.deviceByChannel &&
+    !snapshot.deviceByMigrationChannel &&
+    !snapshot.membership &&
+    snapshot.membershipSummary.total === 0 &&
+    !snapshot.state &&
+    !snapshot.credentialById &&
+    !snapshot.credentialByDigest &&
+    snapshot.credentialSummary.total === 0
+  );
+}
+
+function canMigrateLegacyDevice(
+  snapshot: ProvisioningSnapshot,
+  input: HomecamProvisioningInput,
+) {
+  const summary = snapshot.channelOwnerSummary;
+  return (
+    !snapshot.deviceById &&
+    snapshot.deviceByChannel?.id === input.legacyDeviceId &&
+    !snapshot.deviceByMigrationChannel &&
+    Boolean(summary) &&
+    summary?.membership_count === 1 &&
+    summary.requested_owner_count === 1 &&
+    summary.credential_count === 0 &&
+    summary.active_session_count === 0 &&
+    summary.event_count === 0 &&
+    summary.state_count === 0 &&
     !snapshot.membership &&
     snapshot.membershipSummary.total === 0 &&
     !snapshot.state &&
@@ -368,6 +549,7 @@ function provisioningConflictDetails(
             snapshot.channelOwnerSummary.active_session_count,
           recordingCount: snapshot.channelOwnerSummary.recording_count,
           eventCount: snapshot.channelOwnerSummary.event_count,
+          stateCount: snapshot.channelOwnerSummary.state_count,
           lastSeenAt: snapshot.channelOwnerSummary.last_seen_at,
         }
       : undefined,

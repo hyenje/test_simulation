@@ -123,6 +123,7 @@ test("provisioning route never accepts or returns the plaintext device token", a
   assert.match(route, /DEVICE_PROVISIONING_SECRET/);
   assert.match(route, /DEVICE_PROVISIONING_MANIFEST_SHA256/);
   assert.match(route, /DEVICE_PROVISIONING_EXPIRES_AT/);
+  assert.match(route, /DEVICE_PROVISIONING_LEGACY_DEVICE_ID/);
   assert.match(route, /crypto\.subtle\.digest/);
   assert.match(route, /resources\.source !== "mapping"/);
   assert.doesNotMatch(route, /\btoken:\s/);
@@ -134,4 +135,6 @@ test("provisioning route never accepts or returns the plaintext device token", a
   assert.match(database, /channelOwnerDeviceId/);
   assert.match(database, /requested_owner_count/);
   assert.match(database, /active_session_count/);
+  assert.match(database, /device\.migrate/);
+  assert.match(database, /UPDATE stream_sessions SET device_id/);
 });
