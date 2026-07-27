@@ -27,6 +27,7 @@ const LOCAL_RUNTIME_KEYS = [
   "PUSH_BROKER_SECRET",
   "PUSH_VAPID_PUBLIC_KEY",
   "MAINTENANCE_SECRET",
+  "DEVICE_PROVISIONING_SECRET",
 ];
 
 export default defineConfig(async ({ mode }) => {
