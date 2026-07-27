@@ -36,6 +36,13 @@
       "when": 1785065881856,
       "tag": "0004_homecam_platform",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1785152274695,
+      "tag": "0005_gazebo_homecam",
+      "breakpoints": true
     }
   ]
 }
