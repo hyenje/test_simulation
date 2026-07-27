@@ -1,5 +1,7 @@
 "use client";
 
+import { AUTHORIZED_P2P_DISCONNECT_GRACE_MS } from "./viewer-reconnect";
+
 export type KvsConnectionState = "waiting" | "connecting" | "live" | "offline";
 
 type KvsRole = "MASTER" | "VIEWER";
@@ -285,6 +287,8 @@ export async function connectAuthorizedDeviceViewer(input: {
   deviceId: string;
   clientId?: string;
   localAudioStream?: MediaStream;
+  signal?: AbortSignal;
+  onStorageMode?: (storageMode: boolean) => void;
   onStream: (stream: MediaStream) => void;
   callbacks: ConnectionCallbacks;
 }): Promise<KvsConnection> {
@@ -292,8 +296,9 @@ export async function connectAuthorizedDeviceViewer(input: {
   const clientId = input.clientId ?? `homecam-${crypto.randomUUID()}`;
   const [sdk, config] = await Promise.all([
     loadKvsSdk(),
-    requestAuthorizedDeviceSession(input.deviceId, clientId, undefined, false),
+    requestAuthorizedDeviceSession(input.deviceId, clientId, input.signal, false),
   ]);
+  input.onStorageMode?.(Boolean(config.storageMode));
   if (config.storageMode) {
     const refreshConfig = (signal: AbortSignal) =>
       requestAuthorizedDeviceSession(input.deviceId, clientId, signal, false);
@@ -321,6 +326,7 @@ export async function connectAuthorizedDeviceViewer(input: {
     PeerConnection,
     sdk,
     config,
+    disconnectGraceMs: AUTHORIZED_P2P_DISCONNECT_GRACE_MS,
   });
 }
 
@@ -332,8 +338,10 @@ function connectKvsP2pViewer(input: {
   PeerConnection: typeof RTCPeerConnection;
   sdk: KvsSdk;
   config: KvsSessionConfig;
+  disconnectGraceMs?: number;
 }): KvsConnection {
   let closed = false;
+  let disconnectTimer: number | null = null;
   const queuedCandidates: RTCIceCandidateInit[] = [];
   const peer = new input.PeerConnection({ iceServers: input.config.iceServers });
   peer.addTransceiver("video", { direction: "recvonly" });
@@ -363,9 +371,29 @@ function connectKvsP2pViewer(input: {
   };
   peer.onconnectionstatechange = () => {
     if (closed) return;
-    if (peer.connectionState === "connected") input.callbacks.onState("live");
-    if (["failed", "disconnected"].includes(peer.connectionState)) {
+    if (peer.connectionState === "connected") {
+      if (disconnectTimer !== null) window.clearTimeout(disconnectTimer);
+      disconnectTimer = null;
+      input.callbacks.onState("live");
+    }
+    if (peer.connectionState === "failed") {
+      if (disconnectTimer !== null) window.clearTimeout(disconnectTimer);
+      disconnectTimer = null;
       input.callbacks.onState("offline");
+    }
+    if (peer.connectionState === "disconnected" && disconnectTimer === null) {
+      const graceMs = Math.max(0, input.disconnectGraceMs ?? 0);
+      if (graceMs === 0) {
+        input.callbacks.onState("offline");
+        return;
+      }
+      input.callbacks.onState("connecting");
+      disconnectTimer = window.setTimeout(() => {
+        disconnectTimer = null;
+        if (!closed && peer.connectionState === "disconnected") {
+          input.callbacks.onState("offline");
+        }
+      }, graceMs);
     }
   };
 
@@ -403,10 +431,22 @@ function connectKvsP2pViewer(input: {
     }
   });
   signaling.on("close", () => {
-    if (!closed) input.callbacks.onState("offline");
+    if (
+      !closed &&
+      peer.connectionState !== "connected" &&
+      disconnectTimer === null
+    ) {
+      input.callbacks.onState("offline");
+    }
   });
   signaling.on("error", (error) => {
-    if (!closed) input.callbacks.onError(error);
+    if (
+      !closed &&
+      peer.connectionState !== "connected" &&
+      disconnectTimer === null
+    ) {
+      input.callbacks.onError(error);
+    }
   });
   signaling.open();
 
@@ -414,6 +454,8 @@ function connectKvsP2pViewer(input: {
     storageMode: false,
     close() {
       closed = true;
+      if (disconnectTimer !== null) window.clearTimeout(disconnectTimer);
+      disconnectTimer = null;
       signaling.close();
       peer.close();
     },
