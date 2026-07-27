@@ -91,7 +91,10 @@ export async function POST(request: Request) {
   } catch (error) {
     if (error instanceof HomecamProvisioningConflict) {
       return noStore(
-        { error: "기존 장치 또는 자격 증명과 충돌합니다." },
+        {
+          error: "기존 장치 또는 자격 증명과 충돌합니다.",
+          conflict: error.details,
+        },
         409,
       );
     }

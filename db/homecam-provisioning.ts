@@ -35,8 +35,14 @@ type ProvisioningSnapshot = {
 };
 
 export class HomecamProvisioningConflict extends Error {
-  constructor() {
+  readonly details: ReturnType<typeof provisioningConflictDetails>;
+
+  constructor(
+    snapshot: ProvisioningSnapshot,
+    input: HomecamProvisioningInput,
+  ) {
     super("HOMECAM_PROVISIONING_CONFLICT");
+    this.details = provisioningConflictDetails(snapshot, input);
   }
 }
 
@@ -49,7 +55,7 @@ export async function provisionHomecamDevice(
     return { deviceId: input.deviceId, created: false };
   }
   if (!isEmpty(before)) {
-    throw new HomecamProvisioningConflict();
+    throw new HomecamProvisioningConflict(before, input);
   }
 
   const d1 = getD1();
@@ -121,14 +127,14 @@ export async function provisionHomecamDevice(
       return { deviceId: input.deviceId, created: false };
     }
     if (!isEmpty(afterRace)) {
-      throw new HomecamProvisioningConflict();
+      throw new HomecamProvisioningConflict(afterRace, input);
     }
     throw error;
   }
 
   const after = await provisioningSnapshot(input);
   if (!isCompleteAndCompatible(after, input)) {
-    throw new HomecamProvisioningConflict();
+    throw new HomecamProvisioningConflict(after, input);
   }
   return { deviceId: input.deviceId, created: true };
 }
@@ -272,4 +278,38 @@ function isCompatible(
     snapshot.credentialById.revoked_at === null &&
     snapshot.credentialByDigest?.id === input.credential.id
   );
+}
+
+function provisioningConflictDetails(
+  snapshot: ProvisioningSnapshot,
+  input: HomecamProvisioningInput,
+) {
+  const targetDevice = !snapshot.deviceById
+    ? "absent"
+    : snapshot.deviceById.display_name === input.displayName &&
+        snapshot.deviceById.kvs_channel_arn === input.kvsChannelArn
+      ? "exact"
+      : "mismatch";
+  const channelOwner = !snapshot.deviceByChannel
+    ? "free"
+    : snapshot.deviceByChannel.id === input.deviceId
+      ? "target"
+      : "other";
+  return {
+    targetDevice,
+    channelOwner,
+    channelOwnerDeviceId:
+      channelOwner === "other" ? snapshot.deviceByChannel?.id : undefined,
+    membershipCount: snapshot.membershipSummary.total,
+    exactMembershipCount: snapshot.membershipSummary.exact_count,
+    stateExists: Boolean(snapshot.state),
+    credentialCount: snapshot.credentialSummary.total,
+    exactCredentialCount: snapshot.credentialSummary.exact_count,
+    credentialIdMatches:
+      !snapshot.credentialById ||
+      snapshot.credentialById.device_id === input.deviceId,
+    credentialDigestMatches:
+      !snapshot.credentialByDigest ||
+      snapshot.credentialByDigest.id === input.credential.id,
+  };
 }
