@@ -4,7 +4,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   HomecamDashboard,
   type HomecamDevice,
+  type HomecamTab,
 } from "./components/homecam-dashboard";
+import { HomecamHeader } from "./components/homecam-header";
+import {
+  ArrowClockwise,
+  ArrowLeft,
+  Microphone,
+  ShieldCheck,
+  SpeakerHigh,
+  SpeakerSlash,
+  VideoCamera,
+  WifiHigh,
+} from "@phosphor-icons/react";
 import {
   connectAuthorizedDeviceViewer,
   connectKvsMaster,
@@ -14,6 +26,14 @@ import {
   type KvsConnection,
   type KvsConnectionState,
 } from "./lib/kvs-client";
+import {
+  AUTHORIZED_P2P_CONNECT_TIMEOUT_MS,
+  AUTHORIZED_P2P_MEDIA_TIMEOUT_MS,
+  AUTHORIZED_P2P_STABLE_LIVE_MS,
+  AUTHORIZED_VIEWER_SETUP_TIMEOUT_MS,
+  authorizedP2pReconnectDelayMs,
+  canAutomaticallyReconnectAuthorizedP2p,
+} from "./lib/viewer-reconnect";
 
 type Mode = "landing" | "broadcaster" | "viewer";
 type ConnectionState =
@@ -60,6 +80,12 @@ type Recording = {
 };
 
 type RecordingPlaybackState = "loading" | "ready" | "autoplay-blocked" | "error";
+
+type ViewerTalkLease = {
+  leaseId: string;
+  clientId: string;
+  generation: number;
+};
 
 const STATE_COPY: Record<ConnectionState, string> = {
   idle: "준비 전",
@@ -130,6 +156,23 @@ function StatusBadge({ state }: { state: ConnectionState }) {
     <span className={`status-badge status-${state}`} data-testid="connection-status">
       <span className="status-dot" aria-hidden="true" />
       {STATE_COPY[state]}
+    </span>
+  );
+}
+
+function ViewerStatePill({
+  active,
+  tone,
+  children,
+}: {
+  active: boolean;
+  tone: "live" | "recording" | "camera" | "microphone";
+  children: React.ReactNode;
+}) {
+  return (
+    <span className={`homecam-state-pill state-${tone} ${active ? "is-active" : ""}`}>
+      <span aria-hidden="true" />
+      {children}
     </span>
   );
 }
@@ -743,7 +786,7 @@ function Viewer({
   viewerPassword: string;
   deviceId?: string;
   device?: HomecamDevice;
-  onExit: () => void;
+  onExit: (tab?: HomecamTab) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const microphoneRef = useRef<MediaStream | null>(null);
@@ -751,9 +794,22 @@ function Viewer({
   const viewerClientIdRef = useRef("");
   const viewerMountedRef = useRef(true);
   const talkIntentRef = useRef(false);
-  const talkLeaseRef = useRef("");
+  const talkLeaseRef = useRef<ViewerTalkLease | null>(null);
   const talkLeaseTimerRef = useRef<number | null>(null);
   const storageModeRef = useRef<boolean | null>(null);
+  const viewerGenerationRef = useRef(0);
+  const automaticReconnectAttemptsRef = useRef(0);
+  const automaticReconnectTimerRef = useRef<number | null>(null);
+  const stableLiveTimerRef = useRef<number | null>(null);
+  const reconnectPendingRef = useRef(false);
+  const viewerAccessRevokedRef = useRef(false);
+  const viewerStateRef = useRef<ConnectionState>("connecting");
+  const requestReconnectRef = useRef<
+    ((options?: {
+      message?: string;
+      minimumDelayMs?: number;
+    }) => void) | null
+  >(null);
   const [state, setState] = useState<ConnectionState>("connecting");
   const [attempt, setAttempt] = useState(0);
   const [error, setError] = useState("");
@@ -766,7 +822,38 @@ function Viewer({
   const [talkLeasePending, setTalkLeasePending] = useState(false);
   const [speakerMuted, setSpeakerMuted] = useState(true);
   const [soundBlocked, setSoundBlocked] = useState(false);
-  const [storageMode, setStorageMode] = useState<boolean | null>(null);
+  const expectedStorageMode =
+    deviceId && typeof device?.activeSession?.storageMode === "boolean"
+      ? device.activeSession.storageMode
+      : null;
+  const [storageMode, setStorageMode] = useState<boolean | null>(
+    expectedStorageMode,
+  );
+
+  useEffect(() => {
+    viewerStateRef.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    viewerAccessRevokedRef.current = false;
+    automaticReconnectAttemptsRef.current = 0;
+    reconnectPendingRef.current = false;
+    storageModeRef.current = expectedStorageMode;
+  }, [deviceId, expectedStorageMode]);
+
+  const notifyTalkLeaseRelease = useCallback((lease: ViewerTalkLease) => {
+    if (deviceId) {
+      void fetch(`/api/devices/${encodeURIComponent(deviceId)}/talk-lease`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          leaseId: lease.leaseId,
+          clientId: lease.clientId,
+        }),
+        keepalive: true,
+      }).catch(() => undefined);
+    }
+  }, [deviceId]);
 
   const releaseTalkLease = useCallback((notifyServer = true, updateState = true) => {
     talkIntentRef.current = false;
@@ -776,24 +863,14 @@ function Viewer({
       window.clearTimeout(talkLeaseTimerRef.current);
       talkLeaseTimerRef.current = null;
     }
-    const leaseId = talkLeaseRef.current;
-    talkLeaseRef.current = "";
-    if (notifyServer && deviceId && leaseId) {
-      void fetch(`/api/devices/${encodeURIComponent(deviceId)}/talk-lease`, {
-        method: "DELETE",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          leaseId,
-          clientId: viewerClientIdRef.current,
-        }),
-        keepalive: true,
-      }).catch(() => undefined);
-    }
+    const lease = talkLeaseRef.current;
+    talkLeaseRef.current = null;
+    if (notifyServer && lease) notifyTalkLeaseRelease(lease);
     if (updateState && viewerMountedRef.current) {
       setTalking(false);
       setTalkLeasePending(false);
     }
-  }, [deviceId]);
+  }, [notifyTalkLeaseRelease]);
 
   useEffect(() => {
     viewerMountedRef.current = true;
@@ -808,19 +885,66 @@ function Viewer({
   useEffect(() => {
     const handleRelease = () => releaseTalkLease();
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden") releaseTalkLease();
+      if (document.visibilityState === "hidden") {
+        releaseTalkLease();
+        if (
+          deviceId &&
+          storageModeRef.current === false &&
+          automaticReconnectTimerRef.current !== null
+        ) {
+          window.clearTimeout(automaticReconnectTimerRef.current);
+          automaticReconnectTimerRef.current = null;
+          reconnectPendingRef.current = true;
+        }
+        return;
+      }
+      if (
+        deviceId &&
+        storageModeRef.current === false &&
+        (reconnectPendingRef.current || viewerStateRef.current !== "live")
+      ) {
+        requestReconnectRef.current?.({
+          message: "화면으로 돌아와 홈캠 연결을 다시 확인하고 있습니다.",
+        });
+      }
+    };
+    const handleOffline = () => {
+      releaseTalkLease();
+      if (!deviceId || storageModeRef.current !== false) return;
+      if (automaticReconnectTimerRef.current !== null) {
+        window.clearTimeout(automaticReconnectTimerRef.current);
+        automaticReconnectTimerRef.current = null;
+      }
+      reconnectPendingRef.current = true;
+      viewerStateRef.current = "connecting";
+      setState("connecting");
+    };
+    const handleOnline = () => {
+      if (
+        deviceId &&
+        storageModeRef.current === false &&
+        (reconnectPendingRef.current || viewerStateRef.current !== "live")
+      ) {
+        requestReconnectRef.current?.({
+          message: "네트워크가 복구되어 홈캠에 다시 연결하고 있습니다.",
+        });
+      }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("blur", handleRelease);
     window.addEventListener("pagehide", handleRelease);
     window.addEventListener("pointerup", handleRelease);
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("blur", handleRelease);
       window.removeEventListener("pagehide", handleRelease);
       window.removeEventListener("pointerup", handleRelease);
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
     };
-  }, [releaseTalkLease]);
+  }, [deviceId, releaseTalkLease]);
 
   useEffect(() => {
     if (!deviceId) return;
@@ -834,12 +958,24 @@ function Viewer({
         if (!active || (response.status !== 401 && response.status !== 403)) {
           return;
         }
+        viewerAccessRevokedRef.current = true;
+        viewerGenerationRef.current += 1;
+        reconnectPendingRef.current = false;
+        if (automaticReconnectTimerRef.current !== null) {
+          window.clearTimeout(automaticReconnectTimerRef.current);
+          automaticReconnectTimerRef.current = null;
+        }
+        if (stableLiveTimerRef.current !== null) {
+          window.clearTimeout(stableLiveTimerRef.current);
+          stableLiveTimerRef.current = null;
+        }
         releaseTalkLease();
         connectionRef.current?.close();
         connectionRef.current = null;
         microphoneRef.current?.getTracks().forEach((track) => track.stop());
         microphoneRef.current = null;
         if (videoRef.current) videoRef.current.srcObject = null;
+        viewerStateRef.current = "offline";
         setState("offline");
         setError("홈캠 접근 권한이 해제되었습니다.");
       } catch {
@@ -856,12 +992,19 @@ function Viewer({
 
   useEffect(() => {
     let active = true;
+    const generation = viewerGenerationRef.current + 1;
+    viewerGenerationRef.current = generation;
     const videoElement = videoRef.current;
     let remoteStream: MediaStream | null = null;
     let localConnection: KvsConnection | null = null;
     let observedVideoTrack: MediaStreamTrack | null = null;
+    let connectionStorageMode: boolean | null = expectedStorageMode;
     let transportLive = false;
     let mediaReady = false;
+    let setupTimer: number | null = null;
+    let connectTimer: number | null = null;
+    let mediaTimer: number | null = null;
+    const setupController = deviceId ? new AbortController() : null;
     const localAudioStream = microphoneRef.current ?? undefined;
     localAudioStream?.getAudioTracks().forEach((track) => {
       track.enabled = false;
@@ -872,6 +1015,129 @@ function Viewer({
     if (storageModeRef.current !== true || !viewerClientIdRef.current) {
       viewerClientIdRef.current = `petcam-${crypto.randomUUID()}`;
     }
+
+    const isCurrentGeneration = () =>
+      active && viewerGenerationRef.current === generation;
+
+    const clearSetupTimer = () => {
+      if (setupTimer !== null) window.clearTimeout(setupTimer);
+      setupTimer = null;
+    };
+
+    const clearConnectTimer = () => {
+      if (connectTimer !== null) window.clearTimeout(connectTimer);
+      connectTimer = null;
+    };
+
+    const clearMediaTimer = () => {
+      if (mediaTimer !== null) window.clearTimeout(mediaTimer);
+      mediaTimer = null;
+    };
+
+    const clearStableLiveTimer = () => {
+      if (stableLiveTimerRef.current !== null) {
+        window.clearTimeout(stableLiveTimerRef.current);
+        stableLiveTimerRef.current = null;
+      }
+    };
+
+    const cancelAutomaticReconnect = () => {
+      if (automaticReconnectTimerRef.current !== null) {
+        window.clearTimeout(automaticReconnectTimerRef.current);
+        automaticReconnectTimerRef.current = null;
+      }
+      reconnectPendingRef.current = false;
+    };
+
+    const scheduleAutomaticReconnect = (
+      options: {
+        message?: string;
+        minimumDelayMs?: number;
+      } = {},
+    ) => {
+      if (
+        !isCurrentGeneration() ||
+        !deviceId ||
+        viewerAccessRevokedRef.current
+      ) {
+        return;
+      }
+      const knownStorageMode =
+        connectionStorageMode ?? expectedStorageMode ?? storageModeRef.current;
+      if (knownStorageMode !== false) return;
+
+      releaseTalkLease();
+      clearConnectTimer();
+      clearMediaTimer();
+      clearStableLiveTimer();
+      if (localConnection === null) setupController?.abort();
+
+      if (
+        navigator.onLine === false ||
+        document.visibilityState === "hidden"
+      ) {
+        reconnectPendingRef.current = true;
+        viewerStateRef.current = "connecting";
+        setState("connecting");
+        return;
+      }
+      if (automaticReconnectTimerRef.current !== null) return;
+
+      const completedAttempts = automaticReconnectAttemptsRef.current;
+      if (!canAutomaticallyReconnectAuthorizedP2p(completedAttempts)) {
+        reconnectPendingRef.current = false;
+        viewerStateRef.current = "offline";
+        setError(
+          "자동 재연결을 여러 번 시도했지만 연결하지 못했습니다. 다시 연결 버튼을 눌러 주세요.",
+        );
+        setState("offline");
+        return;
+      }
+
+      const delay = Math.max(
+        options.minimumDelayMs ?? 0,
+        authorizedP2pReconnectDelayMs(completedAttempts),
+      );
+      reconnectPendingRef.current = true;
+      viewerStateRef.current = "connecting";
+      if (options.message) setError(options.message);
+      setState("connecting");
+      automaticReconnectTimerRef.current = window.setTimeout(() => {
+        automaticReconnectTimerRef.current = null;
+        if (!isCurrentGeneration()) return;
+        if (
+          navigator.onLine === false ||
+          document.visibilityState === "hidden"
+        ) {
+          reconnectPendingRef.current = true;
+          return;
+        }
+        reconnectPendingRef.current = false;
+        viewerGenerationRef.current += 1;
+        automaticReconnectAttemptsRef.current += 1;
+        viewerStateRef.current = "connecting";
+        setState("connecting");
+        setStorageMode(null);
+        setAttempt((value) => value + 1);
+      }, delay);
+    };
+    requestReconnectRef.current = scheduleAutomaticReconnect;
+
+    const startMediaTimer = () => {
+      clearMediaTimer();
+      if (
+        !deviceId ||
+        (connectionStorageMode ?? storageModeRef.current) !== false
+      ) {
+        return;
+      }
+      mediaTimer = window.setTimeout(() => {
+        mediaTimer = null;
+        scheduleAutomaticReconnect({
+          message: "영상 수신이 지연되어 홈캠에 다시 연결하고 있습니다.",
+        });
+      }, AUTHORIZED_P2P_MEDIA_TIMEOUT_MS);
+    };
 
     const markVideoReady = () => {
       if (
@@ -884,12 +1150,42 @@ function Viewer({
         return;
       }
       mediaReady = true;
-      if (active && transportLive) {
+      clearMediaTimer();
+      if (isCurrentGeneration() && transportLive) {
+        cancelAutomaticReconnect();
         setError("");
+        viewerStateRef.current = "live";
         setState("live");
+        clearStableLiveTimer();
+        stableLiveTimerRef.current = window.setTimeout(() => {
+          stableLiveTimerRef.current = null;
+          if (
+            isCurrentGeneration() &&
+            transportLive &&
+            mediaReady
+          ) {
+            automaticReconnectAttemptsRef.current = 0;
+          }
+        }, AUTHORIZED_P2P_STABLE_LIVE_MS);
       }
     };
     videoElement?.addEventListener("loadeddata", markVideoReady);
+
+    if (deviceId && expectedStorageMode === false) {
+      setupTimer = window.setTimeout(() => {
+        setupTimer = null;
+        setupController?.abort();
+        scheduleAutomaticReconnect({
+          message: "AWS 연결 정보를 받지 못해 다시 시도하고 있습니다.",
+        });
+      }, AUTHORIZED_VIEWER_SETUP_TIMEOUT_MS);
+      connectTimer = window.setTimeout(() => {
+        connectTimer = null;
+        scheduleAutomaticReconnect({
+          message: "홈캠 연결 시간이 초과되어 다시 시도하고 있습니다.",
+        });
+      }, AUTHORIZED_P2P_CONNECT_TIMEOUT_MS);
+    }
 
     void (async () => {
       try {
@@ -920,9 +1216,11 @@ function Viewer({
               markVideoReady();
               videoTrack.addEventListener("mute", () => {
                 mediaReady = false;
-                if (active && transportLive) {
+                if (isCurrentGeneration() && transportLive) {
                   releaseTalkLease();
+                  viewerStateRef.current = "connecting";
                   setState("connecting");
+                  startMediaTimer();
                 }
               });
               videoTrack.addEventListener(
@@ -931,9 +1229,19 @@ function Viewer({
                   mediaReady = false;
                   transportLive = false;
                   if (videoElement.srcObject === stream) videoElement.srcObject = null;
-                  if (active) {
+                  if (isCurrentGeneration()) {
                     releaseTalkLease();
-                    setState("offline");
+                    if (
+                      deviceId &&
+                      (connectionStorageMode ?? storageModeRef.current) === false
+                    ) {
+                      scheduleAutomaticReconnect({
+                        message: "홈캠 영상이 종료되어 다시 연결하고 있습니다.",
+                      });
+                    } else {
+                      viewerStateRef.current = "offline";
+                      setState("offline");
+                    }
                   }
                 },
                 { once: true },
@@ -942,32 +1250,81 @@ function Viewer({
           },
           callbacks: {
             onState: (next: KvsConnectionState) => {
-              if (!active) return;
+              if (!isCurrentGeneration()) return;
               if (next === "live") {
                 transportLive = true;
+                clearConnectTimer();
                 if (videoElement && remoteStream) videoElement.srcObject = remoteStream;
+                if (!mediaReady) startMediaTimer();
+                viewerStateRef.current = mediaReady ? "live" : "connecting";
                 setState(mediaReady ? "live" : "connecting");
+                return;
+              }
+              if (
+                next === "connecting" &&
+                transportLive &&
+                (connectionStorageMode ?? storageModeRef.current) === false
+              ) {
+                releaseTalkLease();
+                viewerStateRef.current = "connecting";
+                setState("connecting");
                 return;
               }
               transportLive = false;
               mediaReady = false;
+              clearMediaTimer();
               if (next === "offline" && videoElement) videoElement.srcObject = null;
               releaseTalkLease();
-              setState(next);
+              if (
+                next === "offline" &&
+                deviceId &&
+                (connectionStorageMode ?? storageModeRef.current) === false
+              ) {
+                scheduleAutomaticReconnect({
+                  message: "홈캠 연결이 끊겨 자동으로 다시 연결하고 있습니다.",
+                });
+              } else {
+                viewerStateRef.current = next;
+                setState(next);
+              }
             },
             onError: (reason: Error) => {
-              if (!active) return;
+              if (!isCurrentGeneration()) return;
               transportLive = false;
               mediaReady = false;
+              clearMediaTimer();
               releaseTalkLease();
-              setError(reason.message || "AWS KVS 연결에 실패했습니다.");
-              setState("error");
+              const message = reason.message || "AWS KVS 연결에 실패했습니다.";
+              if (
+                deviceId &&
+                (connectionStorageMode ?? storageModeRef.current) === false
+              ) {
+                scheduleAutomaticReconnect({
+                  message,
+                });
+              } else {
+                setError(message);
+                viewerStateRef.current = "error";
+                setState("error");
+              }
             },
           },
         };
         const connection = deviceId
           ? await connectAuthorizedDeviceViewer({
               deviceId,
+              signal: setupController?.signal,
+              onStorageMode: (nextStorageMode) => {
+                connectionStorageMode = nextStorageMode;
+                if (!isCurrentGeneration()) return;
+                storageModeRef.current = nextStorageMode;
+                setStorageMode(nextStorageMode);
+                if (nextStorageMode) {
+                  clearConnectTimer();
+                  clearMediaTimer();
+                  cancelAutomaticReconnect();
+                }
+              },
               ...connectionInput,
             })
           : await connectKvsViewer({
@@ -976,11 +1333,32 @@ function Viewer({
               ...connectionInput,
             });
         localConnection = connection;
-        if (!active) {
+        clearSetupTimer();
+        connectionStorageMode = connection.storageMode;
+        if (!isCurrentGeneration()) {
           connection.close();
         } else {
           setStorageMode(connection.storageMode);
           storageModeRef.current = connection.storageMode;
+          if (connection.storageMode) {
+            clearConnectTimer();
+            clearMediaTimer();
+            cancelAutomaticReconnect();
+          } else {
+            if (
+              connectTimer === null &&
+              !transportLive &&
+              !reconnectPendingRef.current
+            ) {
+              connectTimer = window.setTimeout(() => {
+                connectTimer = null;
+                scheduleAutomaticReconnect({
+                  message: "홈캠 연결 시간이 초과되어 다시 시도하고 있습니다.",
+                });
+              }, AUTHORIZED_P2P_CONNECT_TIMEOUT_MS);
+            }
+            if (transportLive && !mediaReady) startMediaTimer();
+          }
           if (localAudioStream) {
             setMicrophoneNotice("마이크가 연결되었습니다. 말하기 버튼을 누르는 동안만 전송됩니다.");
           } else if (!connection.storageMode) {
@@ -989,15 +1367,45 @@ function Viewer({
           connectionRef.current = connection;
         }
       } catch (reason) {
-        if (!active) return;
+        clearSetupTimer();
+        if (!isCurrentGeneration()) return;
         releaseTalkLease();
-        setError(reason instanceof Error ? reason.message : "보호자 화면에 연결하지 못했습니다.");
-        setState("error");
+        const message =
+          reason instanceof Error && reason.name !== "AbortError"
+            ? reason.message
+            : "홈캠 연결 준비 시간이 초과되었습니다.";
+        if (
+          deviceId &&
+          !viewerAccessRevokedRef.current &&
+          (connectionStorageMode ??
+            expectedStorageMode ??
+            storageModeRef.current) === false
+        ) {
+          scheduleAutomaticReconnect({
+            message,
+          });
+        } else {
+          setError(message || "보호자 화면에 연결하지 못했습니다.");
+          viewerStateRef.current = "error";
+          setState("error");
+        }
       }
     })();
 
     return () => {
       active = false;
+      clearSetupTimer();
+      clearConnectTimer();
+      clearMediaTimer();
+      clearStableLiveTimer();
+      setupController?.abort();
+      if (requestReconnectRef.current === scheduleAutomaticReconnect) {
+        requestReconnectRef.current = null;
+      }
+      if (automaticReconnectTimerRef.current !== null) {
+        window.clearTimeout(automaticReconnectTimerRef.current);
+        automaticReconnectTimerRef.current = null;
+      }
       releaseTalkLease(true, false);
       localAudioStream?.getAudioTracks().forEach((track) => {
         track.enabled = false;
@@ -1010,7 +1418,14 @@ function Viewer({
       }
       remoteStream?.getTracks().forEach((track) => track.stop());
     };
-  }, [attempt, deviceId, releaseTalkLease, roomCode, viewerPassword]);
+  }, [
+    attempt,
+    deviceId,
+    expectedStorageMode,
+    releaseTalkLease,
+    roomCode,
+    viewerPassword,
+  ]);
 
   const prepareMicrophone = async () => {
     if (microphonePending || state !== "live") return;
@@ -1040,6 +1455,7 @@ function Viewer({
       setState("connecting");
       setStorageMode(null);
       setMicrophoneNotice("마이크를 연결하기 위해 AWS 세션을 다시 연결하고 있습니다.");
+      viewerGenerationRef.current += 1;
       setAttempt((value) => value + 1);
     } catch (reason) {
       if (viewerMountedRef.current) {
@@ -1056,7 +1472,17 @@ function Viewer({
 
   const startTalking = async () => {
     const track = microphoneRef.current?.getAudioTracks()[0];
-    if (!track || state !== "live" || talkLeasePending || talking) return;
+    if (
+      !track ||
+      viewerStateRef.current !== "live" ||
+      talkLeasePending ||
+      talking
+    ) {
+      return;
+    }
+    const talkGeneration = viewerGenerationRef.current;
+    const talkClientId = viewerClientIdRef.current;
+    let acquiredLease: ViewerTalkLease | null = null;
     talkIntentRef.current = true;
 
     if (deviceId) {
@@ -1068,7 +1494,7 @@ function Viewer({
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
-              clientId: viewerClientIdRef.current,
+              clientId: talkClientId,
             }),
           },
         );
@@ -1084,15 +1510,33 @@ function Viewer({
               : payload?.error ?? "말하기 권한을 받지 못했습니다.",
           );
         }
-        talkLeaseRef.current = leaseId;
-        if (!talkIntentRef.current || !viewerMountedRef.current || state !== "live") {
-          releaseTalkLease();
+        acquiredLease = {
+          leaseId,
+          clientId: talkClientId,
+          generation: talkGeneration,
+        };
+        if (
+          !talkIntentRef.current ||
+          !viewerMountedRef.current ||
+          viewerStateRef.current !== "live" ||
+          viewerGenerationRef.current !== talkGeneration ||
+          viewerClientIdRef.current !== talkClientId
+        ) {
+          notifyTalkLeaseRelease(acquiredLease);
           return;
         }
+        talkLeaseRef.current = acquiredLease;
 
         const renewLease = async () => {
-          const currentLeaseId = talkLeaseRef.current;
-          if (!currentLeaseId || !talkIntentRef.current || !viewerMountedRef.current) return;
+          const currentLease = talkLeaseRef.current;
+          if (
+            currentLease !== acquiredLease ||
+            !talkIntentRef.current ||
+            !viewerMountedRef.current ||
+            viewerGenerationRef.current !== talkGeneration
+          ) {
+            return;
+          }
           try {
             const renewal = await fetch(
               `/api/devices/${encodeURIComponent(deviceId)}/talk-lease`,
@@ -1100,8 +1544,8 @@ function Viewer({
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({
-                  leaseId: currentLeaseId,
-                  clientId: viewerClientIdRef.current,
+                  leaseId: currentLease.leaseId,
+                  clientId: currentLease.clientId,
                 }),
               },
             );
@@ -1109,18 +1553,24 @@ function Viewer({
               lease?: { leaseId?: string };
               error?: string;
             } | null;
-            if (!renewal.ok || renewalPayload?.lease?.leaseId !== currentLeaseId) {
+            if (
+              !renewal.ok ||
+              renewalPayload?.lease?.leaseId !== currentLease.leaseId
+            ) {
               throw new Error(renewalPayload?.error ?? "말하기 권한을 갱신하지 못했습니다.");
             }
             if (
-              talkLeaseRef.current !== currentLeaseId ||
+              talkLeaseRef.current !== currentLease ||
               !talkIntentRef.current ||
-              !viewerMountedRef.current
+              !viewerMountedRef.current ||
+              viewerGenerationRef.current !== currentLease.generation ||
+              viewerClientIdRef.current !== currentLease.clientId
             ) {
               return;
             }
             talkLeaseTimerRef.current = window.setTimeout(() => void renewLease(), 8_000);
           } catch (reason) {
+            if (talkLeaseRef.current !== currentLease) return;
             releaseTalkLease();
             setMicrophoneNotice(
               reason instanceof Error ? reason.message : "말하기 연결이 종료되었습니다.",
@@ -1129,6 +1579,12 @@ function Viewer({
         };
         talkLeaseTimerRef.current = window.setTimeout(() => void renewLease(), 8_000);
       } catch (reason) {
+        if (
+          viewerGenerationRef.current !== talkGeneration ||
+          viewerClientIdRef.current !== talkClientId
+        ) {
+          return;
+        }
         talkIntentRef.current = false;
         setTalkLeasePending(false);
         setMicrophoneNotice(
@@ -1138,8 +1594,18 @@ function Viewer({
       }
     }
 
-    if (!talkIntentRef.current) {
-      releaseTalkLease();
+    if (
+      !talkIntentRef.current ||
+      viewerGenerationRef.current !== talkGeneration ||
+      viewerClientIdRef.current !== talkClientId ||
+      viewerStateRef.current !== "live" ||
+      (deviceId && talkLeaseRef.current !== acquiredLease)
+    ) {
+      if (acquiredLease && talkLeaseRef.current === acquiredLease) {
+        releaseTalkLease();
+      } else {
+        track.enabled = false;
+      }
       return;
     }
     track.enabled = true;
@@ -1165,136 +1631,235 @@ function Viewer({
   };
 
   return (
-    <main className="app-shell viewer-shell">
-      <Header />
-      <section className="session-heading">
-        <div>
-          <span className="eyebrow">GUARDIAN VIEW · AWS VIEWER</span>
-          <h1>우리 집 실시간 보기</h1>
-          <p>
-            {deviceId
-              ? "가족 계정으로 연결된 홈캠을 보고, 필요할 때 로봇에게 말할 수 있습니다."
-              : <>세션 <strong>{roomCode}</strong>의 영상·음성을 보고, 필요할 때 로봇에게 말할 수 있습니다.</>}
-          </p>
-        </div>
-        <StatusBadge state={state} />
-      </section>
-
-      <section className="guardian-stage">
-        <div className="video-panel guardian-video-panel">
-          <div className="video-toolbar">
-            <span>우리 집 홈캠</span>
-            <span className="quality-label">AWS KVS · PRIVATE</span>
+    <div className="homecam-shell homecam-stream-shell">
+      <HomecamHeader activeTab="live" onNavigate={onExit} />
+      <main className="homecam-main homecam-stream-main">
+        <div className="homecam-stream-context">
+          <button
+            type="button"
+            className="homecam-stream-back"
+            onClick={() => onExit("live")}
+          >
+            <ArrowLeft size={15} weight="bold" aria-hidden="true" />
+            홈캠 홈
+          </button>
+          <div className="homecam-stream-device">
+            <span
+              className={`homecam-online-dot ${state !== "offline" && state !== "error" ? "is-online" : ""}`}
+              aria-hidden="true"
+            />
+            <strong>
+              {device?.displayName ?? (deviceId ? "등록된 홈캠" : `세션 ${roomCode}`)}
+            </strong>
+            <span data-testid="connection-status">{STATE_COPY[state]}</span>
           </div>
-          <div className="video-frame guardian-frame">
-            <video ref={videoRef} autoPlay playsInline muted={speakerMuted} data-testid="guardian-video" />
-            <div className="homecam-viewer-state-row" aria-label="실시간 홈캠 상태">
-              <span className={state === "live" ? "is-active" : ""}><i />LIVE</span>
-              <span className={storageMode && state === "live" ? "is-active is-recording" : ""}><i />REC</span>
-              <span className={state !== "offline" && (device?.cameraEnabled ?? true) ? "is-active" : ""}><i />CAM</span>
-              <span className={(device?.microphoneEnabled ?? true) ? "is-active" : ""}><i />MIC</span>
-            </div>
-            {state !== "live" && (
-              <div className="video-placeholder">
-                <div className="signal-rings" aria-hidden="true"><span /></div>
-                <strong>{state === "offline" ? "카메라 연결이 끊겼어요" : "카메라 신호를 기다리고 있어요"}</strong>
-                <span>송출 노트북이 AWS 채널에 연결되면 영상이 자동으로 나타납니다.</span>
+          <span className="homecam-stream-security">
+            <ShieldCheck size={15} weight="regular" aria-hidden="true" />
+            AWS KVS · PRIVATE
+          </span>
+        </div>
+
+        <section
+          className="homecam-live-view homecam-stream-view"
+          aria-label="우리 집 실시간 홈캠"
+        >
+          <div className="homecam-video-card homecam-stream-video-card">
+            <div className="homecam-video-frame homecam-stream-video-frame">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted={speakerMuted}
+                data-testid="guardian-video"
+              />
+              <div className="homecam-video-topbar">
+                <div className="homecam-state-row" aria-label="실시간 홈캠 상태">
+                  <ViewerStatePill tone="live" active={state === "live"}>LIVE</ViewerStatePill>
+                  <ViewerStatePill
+                    tone="recording"
+                    active={Boolean(storageMode && state === "live")}
+                  >
+                    REC
+                  </ViewerStatePill>
+                  <ViewerStatePill
+                    tone="camera"
+                    active={state !== "offline" && (device?.cameraEnabled ?? true)}
+                  >
+                    CAM
+                  </ViewerStatePill>
+                  <ViewerStatePill
+                    tone="microphone"
+                    active={device?.microphoneEnabled ?? true}
+                  >
+                    MIC
+                  </ViewerStatePill>
+                </div>
+                <span>640 × 400 · SECURE</span>
               </div>
-            )}
-            {state === "live" && (
-              <span className="live-corner">{storageMode ? "REC · LIVE" : "LIVE"}</span>
-            )}
-          </div>
-          {microphoneNotice && <p className="audio-notice">{microphoneNotice}</p>}
-          {error && <p className="error-message" role="alert">{error}</p>}
-          <div className="viewer-actions">
-            <div className="privacy-note">
-              <span className="privacy-dot" aria-hidden="true" />
-              {storageMode === false
-                ? "현재 P2P 폴백 모드에서는 영상을 저장하지 않습니다."
-                : "이 세션의 영상과 양방향 음성은 AWS에 7일간 저장됩니다."}
-            </div>
-            <div className="viewer-control-row">
-              <button
-                className={`button compact ${talking ? "talking" : "secondary"}`}
-                disabled={microphonePending || talkLeasePending || state !== "live"}
-                onClick={() => {
-                  if (!microphoneAvailable) void prepareMicrophone();
-                }}
-                onPointerDown={(event) => {
-                  if (!microphoneAvailable) return;
-                  event.preventDefault();
-                  event.currentTarget.setPointerCapture(event.pointerId);
-                  void startTalking();
-                }}
-                onPointerUp={() => releaseTalkLease()}
-                onPointerCancel={() => releaseTalkLease()}
-                onPointerLeave={() => releaseTalkLease()}
-                onBlur={() => releaseTalkLease()}
-                onKeyDown={(event) => {
-                  if (
-                    microphoneAvailable &&
-                    !event.repeat &&
-                    (event.key === " " || event.key === "Enter")
-                  ) {
-                    event.preventDefault();
-                    void startTalking();
-                  }
-                }}
-                onKeyUp={(event) => {
-                  if (event.key === " " || event.key === "Enter") {
-                    event.preventDefault();
-                    releaseTalkLease();
-                  }
-                }}
-                aria-pressed={talking}
-              >
-                {microphonePending
-                  ? "마이크 권한 확인 중"
-                  : talkLeasePending
-                    ? "말하기 권한 확인 중"
-                  : !microphoneAvailable
-                    ? "마이크 연결"
-                    : talking
-                      ? "말하는 중 · 손을 떼면 음소거"
-                      : "눌러서 말하기"}
-              </button>
-              <button className="button secondary compact" onClick={toggleSpeaker}>
-                {soundBlocked ? "소리 재생" : `로봇 소리 ${speakerMuted ? "켜기" : "끄기"}`}
-              </button>
-              <button
-                className="button secondary compact"
-                disabled={state === "connecting" || microphonePending}
-                onClick={() => {
-                  releaseTalkLease();
-                  setError("");
-                  setState("connecting");
-                  setSoundBlocked(false);
-                  setStorageMode(null);
-                  setAttempt((value) => value + 1);
-                }}
-              >
-                다시 연결
-              </button>
-            </div>
-          </div>
-        </div>
 
-        <aside className="guardian-info">
-          <div className="panel-card">
-            <span className="card-label">세션 정보</span>
-            <dl>
-              <div><dt>{deviceId ? "홈캠" : "세션 코드"}</dt><dd>{device?.displayName ?? (deviceId ? "등록된 기기" : roomCode)}</dd></div>
-              <div><dt>접근 확인</dt><dd>{deviceId ? "소유자·가족 계정" : "코드 + 비밀번호"}</dd></div>
-              <div><dt>내 마이크</dt><dd>{!microphoneAvailable ? "미연결" : talking ? "전송 중" : "기본 음소거"}</dd></div>
-              <div><dt>녹화</dt><dd>{storageMode === false ? "사용 안 함" : "7일 보관"}</dd></div>
-              <div><dt>연결</dt><dd>AWS KVS WebRTC</dd></div>
-            </dl>
+              {state !== "live" && (
+                <div className="homecam-stream-placeholder">
+                  <VideoCamera size={40} weight="light" aria-hidden="true" />
+                  <h1>
+                    {state === "offline"
+                      ? "홈캠 연결이 끊겼어요"
+                      : state === "error"
+                        ? "연결을 다시 확인해 주세요"
+                        : "보안 채널 연결 중"}
+                  </h1>
+                  <p>연결되면 우리 집 영상과 소리가 이 화면에서 바로 시작됩니다.</p>
+                </div>
+              )}
+
+              <div className="homecam-video-bottom">
+                <span>{storageMode === false ? "녹화 꺼짐" : "7일 보관"}</span>
+                <span>허용된 가족 계정만 볼 수 있어요</span>
+              </div>
+            </div>
+
+            {microphoneNotice && (
+              <p className="homecam-stream-notice" role="status">{microphoneNotice}</p>
+            )}
+            {error && (
+              <p className="homecam-stream-notice is-error" role="alert">{error}</p>
+            )}
+
+            <div className="homecam-stream-controls">
+              <div className="homecam-stream-privacy">
+                <ShieldCheck size={17} weight="regular" aria-hidden="true" />
+                <span>
+                  {storageMode === false
+                    ? "P2P 실시간 영상은 저장하지 않습니다."
+                    : "영상과 양방향 음성은 7일간 저장되며 안전하게 보관됩니다."}
+                </span>
+              </div>
+              <div className="homecam-stream-control-buttons">
+                <button
+                  type="button"
+                  className={`homecam-stream-control-button ${talking ? "is-talking" : ""}`}
+                  disabled={microphonePending || talkLeasePending || state !== "live"}
+                  onClick={() => {
+                    if (!microphoneAvailable) void prepareMicrophone();
+                  }}
+                  onPointerDown={(event) => {
+                    if (!microphoneAvailable) return;
+                    event.preventDefault();
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    void startTalking();
+                  }}
+                  onPointerUp={() => releaseTalkLease()}
+                  onPointerCancel={() => releaseTalkLease()}
+                  onPointerLeave={() => releaseTalkLease()}
+                  onBlur={() => releaseTalkLease()}
+                  onKeyDown={(event) => {
+                    if (
+                      microphoneAvailable &&
+                      !event.repeat &&
+                      (event.key === " " || event.key === "Enter")
+                    ) {
+                      event.preventDefault();
+                      void startTalking();
+                    }
+                  }}
+                  onKeyUp={(event) => {
+                    if (event.key === " " || event.key === "Enter") {
+                      event.preventDefault();
+                      releaseTalkLease();
+                    }
+                  }}
+                  aria-pressed={talking}
+                >
+                  <Microphone size={16} weight={talking ? "fill" : "regular"} aria-hidden="true" />
+                  {microphonePending
+                    ? "권한 확인 중"
+                    : talkLeasePending
+                      ? "말하기 준비 중"
+                      : !microphoneAvailable
+                        ? "마이크 연결"
+                        : talking
+                          ? "말하는 중"
+                          : "눌러서 말하기"}
+                </button>
+                <button
+                  type="button"
+                  className="homecam-stream-control-button"
+                  onClick={toggleSpeaker}
+                >
+                  {speakerMuted && !soundBlocked
+                    ? <SpeakerSlash size={16} weight="regular" aria-hidden="true" />
+                    : <SpeakerHigh size={16} weight="regular" aria-hidden="true" />}
+                  {soundBlocked ? "소리 재생" : speakerMuted ? "소리 켜기" : "소리 끄기"}
+                </button>
+                <button
+                  type="button"
+                  className="homecam-stream-control-button"
+                  disabled={microphonePending}
+                  onClick={() => {
+                    if (automaticReconnectTimerRef.current !== null) {
+                      window.clearTimeout(automaticReconnectTimerRef.current);
+                      automaticReconnectTimerRef.current = null;
+                    }
+                    if (stableLiveTimerRef.current !== null) {
+                      window.clearTimeout(stableLiveTimerRef.current);
+                      stableLiveTimerRef.current = null;
+                    }
+                    automaticReconnectAttemptsRef.current = 0;
+                    reconnectPendingRef.current = false;
+                    viewerAccessRevokedRef.current = false;
+                    releaseTalkLease();
+                    setError("");
+                    viewerStateRef.current = "connecting";
+                    setState("connecting");
+                    setSoundBlocked(false);
+                    setStorageMode(null);
+                    viewerGenerationRef.current += 1;
+                    setAttempt((value) => value + 1);
+                  }}
+                >
+                  <ArrowClockwise size={16} weight="bold" aria-hidden="true" />
+                  다시 연결
+                </button>
+              </div>
+            </div>
           </div>
-          <button className="back-button" onClick={onExit}>{deviceId ? "홈캠 홈으로 돌아가기" : "역할 선택으로 돌아가기"}</button>
-        </aside>
-      </section>
-    </main>
+
+          <aside
+            className="homecam-quick-grid homecam-stream-sidebar"
+            aria-label="실시간 연결 정보"
+          >
+            <article className="homecam-summary-card">
+              <span className="summary-icon" aria-hidden="true">
+                <WifiHigh size={22} weight="regular" />
+              </span>
+              <div>
+                <span>연결 상태</span>
+                <strong>{STATE_COPY[state]}</strong>
+              </div>
+            </article>
+            <article className="homecam-summary-card">
+              <span className="summary-icon" aria-hidden="true">
+                <ShieldCheck size={22} weight="regular" />
+              </span>
+              <div>
+                <span>영상 보관</span>
+                <strong>{storageMode === false ? "저장 안 함" : "7일 보관"}</strong>
+              </div>
+            </article>
+            <article className="homecam-summary-card">
+              <span className="summary-icon" aria-hidden="true">
+                <Microphone size={22} weight="regular" />
+              </span>
+              <div>
+                <span>보호자 마이크</span>
+                <strong>
+                  {!microphoneAvailable ? "연결 전" : talking ? "전송 중" : "기본 음소거"}
+                </strong>
+              </div>
+            </article>
+          </aside>
+        </section>
+      </main>
+    </div>
   );
 }
 
@@ -1363,6 +1928,7 @@ function Header() {
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("landing");
+  const [dashboardTab, setDashboardTab] = useState<HomecamTab>("live");
   const [roomCode, setRoomCode] = useState("");
   const [viewerPassword, setViewerPassword] = useState("");
   const [viewerDeviceId, setViewerDeviceId] = useState("");
@@ -1384,8 +1950,9 @@ export default function Home() {
     }
   }, []);
 
-  const reset = () => {
+  const reset = (tab: HomecamTab = "live") => {
     window.history.replaceState({}, "", window.location.pathname);
+    setDashboardTab(tab);
     setMode("landing");
     setRoomCode("");
     setViewerPassword("");
@@ -1447,6 +2014,7 @@ export default function Home() {
 
   return (
     <HomecamDashboard
+      initialTab={dashboardTab}
       onOpenLive={openRegisteredDevice}
       onCreateLegacyBroadcast={createBroadcast}
       onJoinLegacy={joinLegacyBroadcast}

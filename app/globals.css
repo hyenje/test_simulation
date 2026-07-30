@@ -2571,7 +2571,13 @@ a:focus-visible {
   width: fit-content;
   align-items: baseline;
   gap: 9px;
+  padding: 0;
+  border: 0;
   color: var(--homecam-ink);
+  background: transparent;
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
 }
 
 .homecam-brand > strong {
@@ -3753,6 +3759,344 @@ a:focus-visible {
   }
 
   .homecam-family-invite button {
+    min-height: 42px;
+  }
+}
+
+/* Unified live viewer */
+
+.homecam-stream-main {
+  padding-bottom: 28px;
+}
+
+.homecam-stream-context {
+  display: grid;
+  min-height: 68px;
+  grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr);
+  align-items: center;
+  gap: 18px;
+  border-bottom: 1px solid var(--homecam-line);
+}
+
+.homecam-stream-back,
+.homecam-stream-control-button {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 15px;
+  border: 1px solid var(--homecam-line);
+  border-radius: 999px;
+  color: var(--homecam-ink);
+  background: var(--homecam-panel);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.homecam-stream-back {
+  width: fit-content;
+}
+
+.homecam-stream-device {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.homecam-stream-device strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.homecam-stream-device > span:last-child {
+  color: var(--homecam-muted);
+  font-size: 11px;
+}
+
+.homecam-stream-security {
+  display: inline-flex;
+  justify-self: end;
+  align-items: center;
+  gap: 6px;
+  color: var(--homecam-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.homecam-stream-view {
+  align-items: stretch;
+  padding-top: 18px;
+}
+
+.homecam-stream-video-card {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  flex-direction: column;
+  padding: 0;
+  border: 1px solid var(--homecam-line);
+  border-radius: 14px;
+  background: var(--homecam-panel);
+}
+
+.homecam-stream-video-frame {
+  min-height: 0;
+  aspect-ratio: 16 / 10;
+  border-radius: 13px 13px 0 0;
+}
+
+.homecam-stream-video-frame video {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--homecam-charcoal);
+  object-fit: cover;
+}
+
+.homecam-stream-placeholder {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  width: min(460px, calc(100% - 48px));
+  color: #fff;
+  text-align: center;
+  transform: translate(-50%, -45%);
+}
+
+.homecam-stream-placeholder > svg {
+  margin-bottom: 20px;
+  color: rgb(255 255 255 / 0.72);
+}
+
+.homecam-stream-placeholder h1 {
+  margin: 0;
+  font-size: clamp(24px, 3.4vw, 40px);
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}
+
+.homecam-stream-placeholder p {
+  max-width: 390px;
+  margin: 10px auto 0;
+  color: rgb(255 255 255 / 0.58);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.homecam-stream-notice {
+  margin: 0;
+  padding: 11px 16px;
+  border-top: 1px solid var(--homecam-line);
+  color: var(--homecam-muted);
+  background: var(--homecam-paper);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.homecam-stream-notice.is-error {
+  color: var(--homecam-red);
+  background: #f7efed;
+}
+
+.homecam-stream-controls {
+  display: flex;
+  min-height: 78px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--homecam-line);
+}
+
+.homecam-stream-privacy {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--homecam-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.homecam-stream-privacy svg {
+  flex: 0 0 auto;
+  color: var(--homecam-ink);
+}
+
+.homecam-stream-control-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
+.homecam-stream-control-button {
+  min-height: 38px;
+  padding: 0 13px;
+  background: var(--homecam-paper);
+}
+
+.homecam-stream-control-button:first-child {
+  border-color: var(--homecam-ink);
+  color: #fff;
+  background: var(--homecam-ink);
+}
+
+.homecam-stream-control-button.is-talking {
+  border-color: var(--homecam-red);
+  color: #fff;
+  background: var(--homecam-red);
+}
+
+.homecam-stream-control-button:disabled {
+  border-color: var(--homecam-line);
+  color: #979791;
+  background: var(--homecam-paper);
+  cursor: not-allowed;
+}
+
+.homecam-stream-sidebar {
+  align-self: stretch;
+}
+
+.homecam-stream-sidebar .homecam-summary-card {
+  min-height: 0;
+}
+
+@media (hover: hover) {
+  .homecam-stream-back:hover,
+  .homecam-stream-control-button:not(:disabled):hover {
+    border-color: var(--homecam-ink);
+    background: #ecece8;
+  }
+
+  .homecam-stream-control-button:first-child:not(:disabled):hover {
+    color: #fff;
+    background: var(--homecam-charcoal);
+  }
+
+  .homecam-stream-control-button.is-talking:not(:disabled):hover {
+    background: var(--homecam-red);
+  }
+}
+
+@media (max-width: 980px) {
+  .homecam-shell {
+    padding-bottom: calc(82px + env(safe-area-inset-bottom));
+  }
+
+  .homecam-stream-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .homecam-stream-control-buttons {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .homecam-stream-main {
+    padding-bottom: 22px;
+  }
+
+  .homecam-stream-context {
+    min-height: 62px;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .homecam-stream-back {
+    min-width: 40px;
+    padding: 0 11px;
+  }
+
+  .homecam-stream-back {
+    font-size: 0;
+  }
+
+  .homecam-stream-back svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  .homecam-stream-device {
+    min-width: 0;
+    justify-content: flex-start;
+  }
+
+  .homecam-stream-device strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .homecam-stream-security {
+    display: none;
+  }
+
+  .homecam-stream-view {
+    padding-top: 14px;
+  }
+
+  .homecam-stream-video-card,
+  .homecam-stream-video-frame {
+    border-radius: 10px;
+  }
+
+  .homecam-stream-video-frame {
+    border-radius: 9px 9px 0 0;
+  }
+
+  .homecam-stream-placeholder {
+    width: calc(100% - 32px);
+  }
+
+  .homecam-stream-placeholder > svg {
+    width: 30px;
+    height: 30px;
+    margin-bottom: 14px;
+  }
+
+  .homecam-stream-placeholder h1 {
+    font-size: clamp(20px, 6vw, 28px);
+  }
+
+  .homecam-stream-placeholder p {
+    font-size: 11px;
+  }
+
+  .homecam-stream-controls {
+    min-height: 0;
+    padding: 13px;
+  }
+
+  .homecam-stream-sidebar {
+    margin-top: 10px;
+  }
+}
+
+@media (max-width: 420px) {
+  .homecam-stream-device > span:last-child,
+  .homecam-stream-placeholder p {
+    display: none;
+  }
+
+  .homecam-stream-control-buttons {
+    grid-template-columns: 1fr;
+  }
+
+  .homecam-stream-control-button {
+    width: 100%;
     min-height: 42px;
   }
 }

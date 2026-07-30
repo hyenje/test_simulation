@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import {
   ArrowClockwise,
   Bell,
@@ -11,21 +10,21 @@ import {
   CheckCircle,
   ClockCounterClockwise,
   Dog,
-  DownloadSimple,
-  GearSix,
-  House,
   Info,
   Person,
   Play,
   ShieldCheck,
-  User,
   UsersThree,
   VideoCamera,
   Waveform,
   X,
 } from "@phosphor-icons/react";
+import {
+  HomecamHeader,
+  type HomecamTab,
+} from "./homecam-header";
 
-export type HomecamTab = "live" | "events" | "settings";
+export type { HomecamTab } from "./homecam-header";
 
 export type HomecamDevice = {
   id: string;
@@ -67,6 +66,7 @@ type FamilyMember = {
 type ApiAvailability = "loading" | "ready" | "unavailable";
 
 type HomecamDashboardProps = {
+  initialTab?: HomecamTab;
   onOpenLive: (device: HomecamDevice) => Promise<void>;
   onCreateLegacyBroadcast: () => Promise<void>;
   onJoinLegacy: (roomCode: string, password: string) => void;
@@ -395,7 +395,8 @@ function EventPlayback({
         <div className="event-playback-heading">
           <div>
             <span className={`event-kind kind-${event.type}`}>
-              {EVENT_ICONS[event.type]} {EVENT_LABELS[event.type]}
+              <EventKindIcon type={event.type} size={14} />
+              {EVENT_LABELS[event.type]}
             </span>
             <strong>{formatEventTime(event.occurredAt)}</strong>
           </div>
@@ -413,6 +414,7 @@ function EventPlayback({
 }
 
 export function HomecamDashboard({
+  initialTab = "live",
   onOpenLive,
   onCreateLegacyBroadcast,
   onJoinLegacy,
@@ -422,7 +424,7 @@ export function HomecamDashboard({
 }: HomecamDashboardProps) {
   const [devices, setDevices] = useState<HomecamDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
-  const [tab, setTab] = useState<HomecamTab>("live");
+  const [tab, setTab] = useState<HomecamTab>(initialTab);
   const [availability, setAvailability] = useState<ApiAvailability>("loading");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
@@ -442,7 +444,6 @@ export function HomecamDashboard({
   const [legacyOpen, setLegacyOpen] = useState(false);
   const [legacyCode, setLegacyCode] = useState("");
   const [legacyPassword, setLegacyPassword] = useState("");
-  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const deepLinkedEventIdRef = useRef("");
 
   const selectedDevice = useMemo(
@@ -499,22 +500,6 @@ export function HomecamDashboard({
       if (requestedView === "events" || requestedEvent) setTab("events");
       if (requestedView === "settings") setTab("settings");
     });
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetch("/api/auth/me", { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
-        const payload = asRecord(await response.json().catch(() => ({})));
-        return response.ok && payload.authenticated === true;
-      })
-      .then((isAuthenticated) => {
-        if (!controller.signal.aborted) setAuthenticated(isAuthenticated);
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setAuthenticated(false);
-      });
-    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -931,42 +916,12 @@ export function HomecamDashboard({
 
   return (
     <div className="homecam-shell">
-      <header className="homecam-header">
-        <Link className="homecam-brand" href="/" aria-label="MALBUT 홈캠 홈">
-          <strong>/MALBUT</strong>
-          <small>HOME CAMERA</small>
-        </Link>
-        <nav className="homecam-nav" aria-label="홈캠 메뉴">
-          <button type="button" className={tab === "live" ? "is-active" : ""} onClick={() => setTab("live")} aria-current={tab === "live" ? "page" : undefined}>
-            <House size={18} weight={tab === "live" ? "fill" : "regular"} />
-            <span>홈</span>
-          </button>
-          <button type="button" className={tab === "events" ? "is-active" : ""} onClick={() => setTab("events")} aria-current={tab === "events" ? "page" : undefined}>
-            <ClockCounterClockwise size={18} weight={tab === "events" ? "fill" : "regular"} />
-            <span>이벤트</span>
-          </button>
-          <button type="button" className={tab === "settings" ? "is-active" : ""} onClick={() => setTab("settings")} aria-current={tab === "settings" ? "page" : undefined}>
-            <GearSix size={18} weight={tab === "settings" ? "fill" : "regular"} />
-            <span>설정</span>
-          </button>
-        </nav>
-        <div className="homecam-header-actions">
-          {!standalone && installPrompt && (
-            <button type="button" className="homecam-install-button" onClick={installApp}>
-              <DownloadSimple size={15} weight="bold" />
-              홈 화면에 설치
-            </button>
-          )}
-          <a
-            className="homecam-account-link"
-            href={authenticated ? "/signout-with-chatgpt?return_to=%2F" : "/signin-with-chatgpt?return_to=%2F"}
-            aria-label={authenticated ? "로그아웃" : authenticated === null ? "로그인 상태 확인 중" : "ID 로그인"}
-          >
-            <User size={16} weight={authenticated ? "fill" : "regular"} aria-hidden="true" />
-            <span>{authenticated ? "내 계정" : "로그인"}</span>
-          </a>
-        </div>
-      </header>
+      <HomecamHeader
+        activeTab={tab}
+        onNavigate={setTab}
+        onInstall={installApp}
+        showInstall={!standalone && Boolean(installPrompt)}
+      />
 
       <main className="homecam-main">
         {availability === "loading" && (
